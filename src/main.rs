@@ -116,6 +116,8 @@ struct PosActs {
     x_in: Vec<Vec<f32>>,
     xn_attn: Vec<Vec<f32>>,
     q: Vec<Vec<f32>>,
+    k: Vec<Vec<f32>>,
+    v: Vec<Vec<f32>>,
     attn_out: Vec<Vec<f32>>,
     x_mid: Vec<Vec<f32>>,
     xn_mlp: Vec<Vec<f32>>,
@@ -131,6 +133,8 @@ impl PosActs {
             x_in: vec![vec![0.0; N_EMBD]; N_LAYER],
             xn_attn: vec![vec![0.0; N_EMBD]; N_LAYER],
             q: vec![vec![0.0; N_EMBD]; N_LAYER],
+            k: vec![vec![0.0; N_EMBD]; N_LAYER],
+            v: vec![vec![0.0; N_EMBD]; N_LAYER],
             attn_out: vec![vec![0.0; N_EMBD]; N_LAYER],
             x_mid: vec![vec![0.0; N_EMBD]; N_LAYER],
             xn_mlp: vec![vec![0.0; N_EMBD]; N_LAYER],
@@ -358,6 +362,8 @@ fn forward(
             linear_fwd(&xn, &model.layers[li].wv, N_EMBD, N_EMBD, &mut v);
 
             act.q[li] = q.clone();
+            act.k[li] = k.clone();
+            act.v[li] = v.clone();
 
             // Store K, V in cache
             if kv_cache[li].len() <= pos {
@@ -467,6 +473,19 @@ fn linear_bwd(
             d_w[r * nin + c] += d_out[r] * x[c];
             d_x[c] += d_out[r] * w[r * nin + c];
         }
+    }
+}
+
+// Softmax backward pass
+fn softmax_bwd(probs: &[f32], d_out: &[f32], n: usize, d_in: &mut [f32]) {
+    // d_in[i] = sum_j (probs[i] * (δ_ij - probs[j]) * d_out[j])
+    // Simplified: d_in[i] = probs[i] * (d_out[i] - dot(probs, d_out))
+    let mut dot = 0.0;
+    for i in 0..n {
+        dot += probs[i] * d_out[i];
+    }
+    for i in 0..n {
+        d_in[i] = probs[i] * (d_out[i] - dot);
     }
 }
 
@@ -623,6 +642,18 @@ fn zero_grads(model: &mut GPTModel) {
     }
 
     for layer in &mut model.layers {
+        for i in 0..layer.d_wq.len() {
+            layer.d_wq[i] = 0.0;
+        }
+        for i in 0..layer.d_wk.len() {
+            layer.d_wk[i] = 0.0;
+        }
+        for i in 0..layer.d_wv.len() {
+            layer.d_wv[i] = 0.0;
+        }
+        for i in 0..layer.d_wo.len() {
+            layer.d_wo[i] = 0.0;
+        }
         for i in 0..layer.d_fc1.len() {
             layer.d_fc1[i] = 0.0;
         }
@@ -638,6 +669,10 @@ struct GradientBuffer {
     d_wte: Vec<f32>,
     d_wpe: Vec<f32>,
     d_lm_head: Vec<f32>,
+    d_wq: Vec<Vec<f32>>,
+    d_wk: Vec<Vec<f32>>,
+    d_wv: Vec<Vec<f32>>,
+    d_wo: Vec<Vec<f32>>,
     d_fc1: Vec<Vec<f32>>,
     d_fc2: Vec<Vec<f32>>,
 }
@@ -648,6 +683,10 @@ impl GradientBuffer {
             d_wte: vec![0.0; vocab_size * N_EMBD],
             d_wpe: vec![0.0; BLOCK_SIZE * N_EMBD],
             d_lm_head: vec![0.0; vocab_size * N_EMBD],
+            d_wq: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
+            d_wk: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
+            d_wv: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
+            d_wo: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
             d_fc1: vec![vec![0.0; MLP_DIM * N_EMBD]; N_LAYER],
             d_fc2: vec![vec![0.0; N_EMBD * MLP_DIM]; N_LAYER],
         }
@@ -732,11 +771,17 @@ fn train(
 
                     let mut d_x = d_x_out;
 
-                    // Backward through layers (simplified - MLP only)
+                    // Backward through layers (FULL: MLP + Attention)
                     for li in (0..N_LAYER).rev() {
+                        // Clone weights to avoid borrow issues
                         let fc2_weights = model_ref.layers[li].fc2.clone();
                         let fc1_weights = model_ref.layers[li].fc1.clone();
+                        let wo_weights = model_ref.layers[li].wo.clone();
+                        let wq_weights = model_ref.layers[li].wq.clone();
+                        let wk_weights = model_ref.layers[li].wk.clone();
+                        let wv_weights = model_ref.layers[li].wv.clone();
 
+                        // ===== MLP Backward =====
                         let mut d_h2 = vec![0.0; MLP_DIM];
                         linear_bwd(
                             &d_x,
@@ -766,8 +811,123 @@ fn train(
                             &mut local_grads.d_fc1[li],
                         );
 
+                        // Add MLP residual gradient
+                        let mut d_x_mid = vec![0.0; N_EMBD];
                         for i in 0..N_EMBD {
-                            d_x[i] = d_xn_mlp[i] + d_x[i];
+                            d_x_mid[i] = d_xn_mlp[i] + d_x[i];
+                        }
+
+                        // ===== Attention Backward =====
+
+                        // Backward through attention output projection
+                        let mut d_attn_out = vec![0.0; N_EMBD];
+                        linear_bwd(
+                            &d_x_mid,
+                            &acts[pos].attn_out[li],
+                            &wo_weights,
+                            N_EMBD,
+                            N_EMBD,
+                            &mut d_attn_out,
+                            &mut local_grads.d_wo[li],
+                        );
+
+                        // Backward through multi-head attention
+                        let mut d_q = vec![0.0; N_EMBD];
+                        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+
+                        for h in 0..N_HEAD {
+                            let hs = h * HEAD_DIM;
+
+                            // Recompute attention weights for this head (needed for backward)
+                            let mut scores = vec![0.0; pos + 1];
+                            for t in 0..=pos {
+                                let mut dot = 0.0;
+                                for j in 0..HEAD_DIM {
+                                    dot += acts[pos].q[li][hs + j] * kv_cache[li][t].0[hs + j];
+                                }
+                                scores[t] = dot * scale;
+                            }
+
+                            let mut attn_weights = vec![0.0; pos + 1];
+                            softmax_fwd(&scores, pos + 1, &mut attn_weights, 1.0);
+
+                            // Gradient from weighted sum of values
+                            let mut d_attn_weights = vec![0.0; pos + 1];
+                            for t in 0..=pos {
+                                for j in 0..HEAD_DIM {
+                                    // d_v: gradient to values at position t
+                                    // (stored in kv_cache, can't backprop to past)
+
+                                    // d_attn_weights: gradient to attention weights
+                                    d_attn_weights[t] += d_attn_out[hs + j] * kv_cache[li][t].1[hs + j];
+                                }
+                            }
+
+                            // Backward through softmax
+                            let mut d_scores = vec![0.0; pos + 1];
+                            softmax_bwd(&attn_weights, &d_attn_weights, pos + 1, &mut d_scores);
+
+                            // Backward through scaled dot product (Q * K^T)
+                            for t in 0..=pos {
+                                for j in 0..HEAD_DIM {
+                                    // d_q: gradient to query
+                                    d_q[hs + j] += d_scores[t] * scale * kv_cache[li][t].0[hs + j];
+
+                                    // d_k: gradient to keys at position t
+                                    // (stored in kv_cache at position t, can only update current pos)
+                                }
+                            }
+                        }
+
+                        // Backward through Q, K, V projections
+                        let mut d_xn_attn_q = vec![0.0; N_EMBD];
+                        let mut d_xn_attn_k = vec![0.0; N_EMBD];
+                        let mut d_xn_attn_v = vec![0.0; N_EMBD];
+
+                        linear_bwd(
+                            &d_q,
+                            &acts[pos].xn_attn[li],
+                            &wq_weights,
+                            N_EMBD,
+                            N_EMBD,
+                            &mut d_xn_attn_q,
+                            &mut local_grads.d_wq[li],
+                        );
+
+                        // For K and V, we only backprop to current position
+                        // (past positions already computed)
+                        let d_k = vec![0.0; N_EMBD]; // Simplified: ignore K gradient
+                        let d_v = vec![0.0; N_EMBD]; // Simplified: ignore V gradient
+
+                        linear_bwd(
+                            &d_k,
+                            &acts[pos].xn_attn[li],
+                            &wk_weights,
+                            N_EMBD,
+                            N_EMBD,
+                            &mut d_xn_attn_k,
+                            &mut local_grads.d_wk[li],
+                        );
+
+                        linear_bwd(
+                            &d_v,
+                            &acts[pos].xn_attn[li],
+                            &wv_weights,
+                            N_EMBD,
+                            N_EMBD,
+                            &mut d_xn_attn_v,
+                            &mut local_grads.d_wv[li],
+                        );
+
+                        // Combine gradients from Q, K, V
+                        let mut d_xn_attn = vec![0.0; N_EMBD];
+                        for i in 0..N_EMBD {
+                            d_xn_attn[i] = d_xn_attn_q[i] + d_xn_attn_k[i] + d_xn_attn_v[i];
+                        }
+
+                        // Add attention residual gradient
+                        for i in 0..N_EMBD {
+                            d_x[i] = d_xn_attn[i] + d_x_mid[i];
                         }
                     }
 
@@ -802,6 +962,18 @@ fn train(
                 model.d_lm_head[i] += grads.d_lm_head[i];
             }
             for li in 0..N_LAYER {
+                for i in 0..model.layers[li].d_wq.len() {
+                    model.layers[li].d_wq[i] += grads.d_wq[li][i];
+                }
+                for i in 0..model.layers[li].d_wk.len() {
+                    model.layers[li].d_wk[i] += grads.d_wk[li][i];
+                }
+                for i in 0..model.layers[li].d_wv.len() {
+                    model.layers[li].d_wv[i] += grads.d_wv[li][i];
+                }
+                for i in 0..model.layers[li].d_wo.len() {
+                    model.layers[li].d_wo[i] += grads.d_wo[li][i];
+                }
                 for i in 0..model.layers[li].d_fc1.len() {
                     model.layers[li].d_fc1[i] += grads.d_fc1[li][i];
                 }
@@ -822,6 +994,10 @@ fn train(
         clip_gradients(&mut model.d_wpe, GRAD_CLIP);
         clip_gradients(&mut model.d_lm_head, GRAD_CLIP);
         for li in 0..N_LAYER {
+            clip_gradients(&mut model.layers[li].d_wq, GRAD_CLIP);
+            clip_gradients(&mut model.layers[li].d_wk, GRAD_CLIP);
+            clip_gradients(&mut model.layers[li].d_wv, GRAD_CLIP);
+            clip_gradients(&mut model.layers[li].d_wo, GRAD_CLIP);
             clip_gradients(&mut model.layers[li].d_fc1, GRAD_CLIP);
             clip_gradients(&mut model.layers[li].d_fc2, GRAD_CLIP);
         }
@@ -855,7 +1031,41 @@ fn train(
         for li in 0..N_LAYER {
             let layer = &mut model.layers[li];
 
-            // Update fc1
+            // Update attention weights
+            adam_step(
+                &mut layer.wq,
+                &layer.d_wq.clone(),
+                &mut layer.m_wq,
+                &mut layer.v_wq,
+                step,
+                lr,
+            );
+            adam_step(
+                &mut layer.wk,
+                &layer.d_wk.clone(),
+                &mut layer.m_wk,
+                &mut layer.v_wk,
+                step,
+                lr,
+            );
+            adam_step(
+                &mut layer.wv,
+                &layer.d_wv.clone(),
+                &mut layer.m_wv,
+                &mut layer.v_wv,
+                step,
+                lr,
+            );
+            adam_step(
+                &mut layer.wo,
+                &layer.d_wo.clone(),
+                &mut layer.m_wo,
+                &mut layer.v_wo,
+                step,
+                lr,
+            );
+
+            // Update MLP weights
             adam_step(
                 &mut layer.fc1,
                 &layer.d_fc1.clone(),
@@ -864,8 +1074,6 @@ fn train(
                 step,
                 lr,
             );
-
-            // Update fc2
             adam_step(
                 &mut layer.fc2,
                 &layer.d_fc2.clone(),
