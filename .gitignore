@@ -1,0 +1,28 @@
+# Rust
+/target/
+**/*.rs.bk
+*.pdb
+Cargo.lock
+
+# Training data (large files)
+data/
+*.txt
+!examples/*.txt
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Training outputs
+checkpoints/
+logs/
+
+# Temporary files
+train_small.txt
