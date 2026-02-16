@@ -18,11 +18,13 @@ const MAX_VOCAB: usize = 512;     // Support more characters/tokens
 // Training parameters
 const BATCH_SIZE: usize = 32;
 const LEARNING_RATE: f32 = 3e-4;
+const MIN_LEARNING_RATE: f32 = 3e-5;  // Decay to 10% of initial
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPSILON: f32 = 1e-8;
 const MAX_ITERS: usize = 1000;  // Increased for better results
 const EVAL_INTERVAL: usize = 100;
+const GRAD_CLIP: f32 = 1.0;  // Gradient clipping threshold
 
 /* ------------------------------------------------------------------ */
 /* Minimal xorshift PRNG                                             */
@@ -558,13 +560,43 @@ fn backward_simple(
     }
 }
 
-// Adam optimizer step
+// Learning rate schedule with cosine decay
+fn get_learning_rate(iter: usize, max_iters: usize) -> f32 {
+    if iter < 100 {
+        // Warmup: linearly increase from 10% to 100%
+        LEARNING_RATE * (0.1 + 0.9 * iter as f32 / 100.0)
+    } else {
+        // Cosine decay from LEARNING_RATE to MIN_LEARNING_RATE
+        let progress = ((iter - 100) as f32) / ((max_iters - 100) as f32);
+        let cosine = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+        MIN_LEARNING_RATE + (LEARNING_RATE - MIN_LEARNING_RATE) * cosine
+    }
+}
+
+// Gradient clipping
+fn clip_gradients(grads: &mut [f32], max_norm: f32) {
+    let mut norm = 0.0;
+    for &g in grads.iter() {
+        norm += g * g;
+    }
+    norm = norm.sqrt();
+
+    if norm > max_norm {
+        let scale = max_norm / norm;
+        for g in grads.iter_mut() {
+            *g *= scale;
+        }
+    }
+}
+
+// Adam optimizer step with learning rate
 fn adam_step(
     params: &mut [f32],
     grads: &[f32],
     m: &mut [f32],
     v: &mut [f32],
     t: usize,
+    lr: f32,
 ) {
     let t_f = t as f32;
     for i in 0..params.len() {
@@ -574,7 +606,7 @@ fn adam_step(
         let m_hat = m[i] / (1.0 - BETA1.powf(t_f));
         let v_hat = v[i] / (1.0 - BETA2.powf(t_f));
 
-        params[i] -= LEARNING_RATE * m_hat / (v_hat.sqrt() + EPSILON);
+        params[i] -= lr * m_hat / (v_hat.sqrt() + EPSILON);
     }
 }
 
@@ -632,11 +664,14 @@ fn train(
     println!("=== Starting Training (Multi-Core with Rayon) ===");
     println!("Iterations: {}", iterations);
     println!("Batch size: {}", BATCH_SIZE);
-    println!("Learning rate: {}", LEARNING_RATE);
+    println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
+    println!("Gradient clipping: {}", GRAD_CLIP);
     println!("Cores available: {}", rayon::current_num_threads());
     println!();
 
     let mut step = 0;
+    let mut best_loss = f32::INFINITY;
+    let mut best_iter = 0;
 
     for iter in 0..iterations {
         // Generate batch indices (sequential, using our RNG)
@@ -774,13 +809,26 @@ fn train(
         batch_loss /= batch_starts.len() as f32;
         step += 1;
 
-        // Optimizer step
+        // Get learning rate for this iteration
+        let lr = get_learning_rate(iter, iterations);
+
+        // Clip gradients
+        clip_gradients(&mut model.d_wte, GRAD_CLIP);
+        clip_gradients(&mut model.d_wpe, GRAD_CLIP);
+        clip_gradients(&mut model.d_lm_head, GRAD_CLIP);
+        for li in 0..N_LAYER {
+            clip_gradients(&mut model.layers[li].d_fc1, GRAD_CLIP);
+            clip_gradients(&mut model.layers[li].d_fc2, GRAD_CLIP);
+        }
+
+        // Optimizer step with current learning rate
         adam_step(
             &mut model.wte,
             &model.d_wte,
             &mut model.m_wte,
             &mut model.v_wte,
             step,
+            lr,
         );
         adam_step(
             &mut model.wpe,
@@ -788,6 +836,7 @@ fn train(
             &mut model.m_wpe,
             &mut model.v_wpe,
             step,
+            lr,
         );
         adam_step(
             &mut model.lm_head,
@@ -795,6 +844,7 @@ fn train(
             &mut model.m_lm_head,
             &mut model.v_lm_head,
             step,
+            lr,
         );
 
         for li in 0..N_LAYER {
@@ -807,6 +857,7 @@ fn train(
                 &mut layer.m_fc1,
                 &mut layer.v_fc1,
                 step,
+                lr,
             );
 
             // Update fc2
@@ -816,17 +867,26 @@ fn train(
                 &mut layer.m_fc2,
                 &mut layer.v_fc2,
                 step,
+                lr,
             );
+        }
+
+        // Track best loss
+        if batch_loss < best_loss {
+            best_loss = batch_loss;
+            best_iter = iter;
         }
 
         // Log progress
         if iter % EVAL_INTERVAL == 0 || iter == iterations - 1 {
-            println!("Iter {:4} | Loss: {:.4}", iter, batch_loss);
+            println!("Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{}",
+                iter, batch_loss, lr, best_loss, best_iter);
         }
     }
 
     println!();
     println!("Training complete!");
+    println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
 }
 
 /* ------------------------------------------------------------------ */
