@@ -333,6 +333,8 @@ fn forward(
     tokens: &[usize],
     model: &GPTModel,
     kv_cache: &mut Vec<Vec<(Vec<f32>, Vec<f32>)>>,
+    training: bool,
+    mut rng: Option<&mut Rng>,
 ) -> (Vec<Vec<f32>>, Vec<PosActs>) {
     let seq_len = tokens.len();
     let mut all_logits = Vec::new();
@@ -412,6 +414,13 @@ fn forward(
             let mut attn_proj = vec![0.0; N_EMBD];
             linear_fwd(&attn_out, &model.layers[li].wo, N_EMBD, N_EMBD, &mut attn_proj);
 
+            // Apply dropout to attention output during training
+            if training {
+                if let Some(r) = rng.as_deref_mut() {
+                    apply_dropout(&mut attn_proj, DROPOUT_RATE, r);
+                }
+            }
+
             for i in 0..N_EMBD {
                 x[i] = attn_proj[i] + act.x_in[li][i];
             }
@@ -435,6 +444,13 @@ fn forward(
 
             let mut mlp_out = vec![0.0; N_EMBD];
             linear_fwd(&h2, &model.layers[li].fc2, N_EMBD, MLP_DIM, &mut mlp_out);
+
+            // Apply dropout to MLP output during training
+            if training {
+                if let Some(r) = rng.as_deref_mut() {
+                    apply_dropout(&mut mlp_out, DROPOUT_RATE, r);
+                }
+            }
 
             // MLP residual
             for i in 0..N_EMBD {
@@ -765,10 +781,13 @@ fn train(
                 let x_vec: Vec<usize> = data[start_idx..start_idx + BLOCK_SIZE].to_vec();
                 let y_vec: Vec<usize> = data[start_idx + 1..start_idx + BLOCK_SIZE + 1].to_vec();
 
-                // Forward pass
+                // Thread-local RNG for dropout
+                let mut thread_rng = Rng::new(start_idx as u64 + iter as u64);
+
+                // Forward pass (with training=true and dropout enabled)
                 let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
                     (0..N_LAYER).map(|_| Vec::new()).collect();
-                let (logits_seq, acts) = forward(&x_vec, model_ref, &mut kv_cache);
+                let (logits_seq, acts) = forward(&x_vec, model_ref, &mut kv_cache, true, Some(&mut thread_rng));
 
                 // Compute gradients (thread-local)
                 let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
@@ -1165,8 +1184,8 @@ fn generate(
         (0..N_LAYER).map(|_| Vec::new()).collect();
 
     for _ in tokens.len()..max_len {
-        // Forward pass
-        let (logits_seq, _) = forward(&tokens, model, &mut kv_cache);
+        // Forward pass (training=false, no dropout)
+        let (logits_seq, _) = forward(&tokens, model, &mut kv_cache, false, None);
         let logits = &logits_seq[logits_seq.len() - 1];
 
         // Sample next token with top-p
@@ -1245,7 +1264,8 @@ fn estimate_loss(
         let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
             (0..N_LAYER).map(|_| Vec::new()).collect();
 
-        let (logits_seq, _) = forward(x, model, &mut kv_cache);
+        // Evaluation mode (training=false, no dropout)
+        let (logits_seq, _) = forward(x, model, &mut kv_cache, false, None);
 
         for (logits, &target) in logits_seq.iter().zip(y.iter()) {
             let mut probs = vec![0.0; model.vocab_size];

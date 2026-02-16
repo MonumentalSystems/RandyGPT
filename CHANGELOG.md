@@ -19,7 +19,11 @@ All notable changes to randyGPT are documented here.
 - **AdamW optimizer**: Added weight decay (0.01) for better generalization
 - **GPT-2 style initialization**: Output projections scaled by 1/sqrt(2*N_LAYER)
   - Accounts for residual accumulation across deeper network
-- **Dropout support**: Added dropout function (rate: 0.1) for regularization
+- **Dropout regularization**: Fully integrated during training (rate: 0.1)
+  - Applied after attention and MLP output projections
+  - Randomly zeros 10% of activations (scaled by 1/0.9)
+  - Disabled during evaluation and generation
+  - Thread-safe implementation with per-thread RNG
 
 #### CLI Improvements
 - **Command-line arguments**: Pass iteration count as `./randygpt <iterations>`
@@ -35,6 +39,7 @@ All notable changes to randyGPT are documented here.
 | **LR Schedule** | Immediate decay | Constant → Cosine |
 | **Optimizer** | Adam | AdamW (with weight decay) |
 | **Initialization** | Standard | GPT-2 style |
+| **Dropout** | ❌ | ✅ (0.1 rate) |
 | **CLI Args** | ❌ | ✅ |
 
 ### 🔧 Technical Details
@@ -51,6 +56,12 @@ Decay: Last 20% (cosine decay to min_lr)
 **Initialization**:
 - Input projections: std = 0.02
 - Output projections: std = 0.02 / sqrt(2 * N_LAYER)
+
+**Dropout**:
+- Rate: 0.1 (10% of activations zeroed)
+- Applied: After attention output projection, after MLP output
+- Scaling: 1 / (1 - dropout_rate) = 1.11x during training
+- Thread-safe: Unique RNG seed per parallel batch item
 
 ### 📝 Documentation
 - Updated parameter counts in README
@@ -173,6 +184,7 @@ Cores used: 12 available, ~8 effectively utilized
 | **Optimizer** | - | Adam | Adam | AdamW |
 | **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay |
 | **Initialization** | Random | Standard | Standard | GPT-2 style |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) |
 | **Speed (1000 iter)** | N/A | ~600s* | ~78s | ~120s** |
 | **CPU Usage** | 100% | 100% | 825% | 825% |
 | **Quality** | Random | Learning | Learning faster | Better capacity |
