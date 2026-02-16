@@ -2,6 +2,62 @@
 
 All notable changes to randyGPT are documented here.
 
+## [0.4.0] - 2026-02-16
+
+### 🚀 Major Improvements
+
+#### Scaled Model Architecture
+- **256-dimensional embeddings** (up from 128)
+- **6 transformer layers** (up from 4)
+- **~4.77M parameters** (up from ~800K, 6x increase)
+- Better model capacity for learning complex patterns
+
+#### Training Optimizations
+- **Fixed learning rate schedule**: Constant until 80% of training, then cosine decay
+  - Previous: Started decaying at iter 100, causing premature plateau
+  - Now: Full learning until 80% complete, smooth decay in final 20%
+- **AdamW optimizer**: Added weight decay (0.01) for better generalization
+- **GPT-2 style initialization**: Output projections scaled by 1/sqrt(2*N_LAYER)
+  - Accounts for residual accumulation across deeper network
+- **Dropout support**: Added dropout function (rate: 0.1) for regularization
+
+#### CLI Improvements
+- **Command-line arguments**: Pass iteration count as `./randygpt <iterations>`
+- No more recompilation to change training length
+
+### 📊 Architecture Comparison
+
+| Feature | v0.3 | v0.4 |
+|---------|------|------|
+| **Embedding Dim** | 128 | 256 |
+| **Layers** | 4 | 6 |
+| **Parameters** | ~800K | ~4.77M |
+| **LR Schedule** | Immediate decay | Constant → Cosine |
+| **Optimizer** | Adam | AdamW (with weight decay) |
+| **Initialization** | Standard | GPT-2 style |
+| **CLI Args** | ❌ | ✅ |
+
+### 🔧 Technical Details
+
+**Learning Rate Schedule**:
+```
+Warmup: 0-100 iterations (linear warmup)
+Constant: 100-80% of total (full learning rate)
+Decay: Last 20% (cosine decay to min_lr)
+```
+
+**Weight Decay**: 0.01 (L2 regularization on all parameters)
+
+**Initialization**:
+- Input projections: std = 0.02
+- Output projections: std = 0.02 / sqrt(2 * N_LAYER)
+
+### 📝 Documentation
+- Updated parameter counts in README
+- Added CLI usage instructions
+
+---
+
 ## [0.3.0] - 2026-02-16
 
 ### 🚀 Major Features
@@ -108,19 +164,21 @@ Cores used: 12 available, ~8 effectively utilized
 
 ## Comparison Table
 
-| Feature | v0.1 | v0.2 | v0.3 |
-|---------|------|------|------|
-| **Layers** | 1 | 4 | 4 |
-| **Embedding Dim** | 32 | 128 | 128 |
-| **Parameters** | ~10K | ~800K | ~800K |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core |
-| **Loss Tracking** | ❌ | ✅ | ✅ |
-| **Speed (1000 iter)** | N/A | ~600s* | ~78s |
-| **CPU Usage** | 100% | 100% | 825% |
-| **Speedup** | 1x | 1x | 8x |
-| **Quality** | Random | Learning | Learning faster |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 |
+|---------|------|------|------|------|
+| **Layers** | 1 | 4 | 4 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~4.77M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core |
+| **Optimizer** | - | Adam | Adam | AdamW |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay |
+| **Initialization** | Random | Standard | Standard | GPT-2 style |
+| **Speed (1000 iter)** | N/A | ~600s* | ~78s | ~120s** |
+| **CPU Usage** | 100% | 100% | 825% | 825% |
+| **Quality** | Random | Learning | Learning faster | Better capacity |
 
 *Estimated
+**Estimated (slower due to 6x more params)
 
 ---
 

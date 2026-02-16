@@ -7,18 +7,20 @@ use rayon::prelude::*;
 /* ------------------------------------------------------------------ */
 /* Enhanced Model hyper-parameters                                    */
 /* ------------------------------------------------------------------ */
-const N_EMBD: usize = 128;        // Increased from 32
-const N_HEAD: usize = 8;          // Increased from 4
-const N_LAYER: usize = 4;         // Increased from 1
-const BLOCK_SIZE: usize = 64;     // Increased from 8
+const N_EMBD: usize = 256;        // Scaled up from 128 (3M params)
+const N_HEAD: usize = 8;          // Keep 8 heads
+const N_LAYER: usize = 6;         // Scaled up from 4 (deeper model)
+const BLOCK_SIZE: usize = 64;     // Keep 64 context
 const HEAD_DIM: usize = N_EMBD / N_HEAD;
 const MLP_DIM: usize = 4 * N_EMBD;
 const MAX_VOCAB: usize = 512;     // Support more characters/tokens
 
 // Training parameters
 const BATCH_SIZE: usize = 32;
-const LEARNING_RATE: f32 = 3e-5;      // Compensate for 64x more grad updates
+const LEARNING_RATE: f32 = 3e-5;      // Tuned for larger model
 const MIN_LEARNING_RATE: f32 = 3e-6;  // Decay to 10% of initial
+const WEIGHT_DECAY: f32 = 0.01;       // L2 regularization
+const DROPOUT_RATE: f32 = 0.1;        // Dropout probability
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPSILON: f32 = 1e-8;
@@ -174,7 +176,7 @@ struct LayerWeights {
 }
 
 impl LayerWeights {
-    fn new(rng: &mut Rng) -> Self {
+    fn new(rng: &mut Rng, _layer_idx: usize) -> Self {
         let mut make_params = |sz: usize, std: f32| -> Vec<f32> {
             (0..sz).map(|_| rng.gauss(0.0, std)).collect()
         };
@@ -183,15 +185,20 @@ impl LayerWeights {
             vec![0.0; sz]
         };
 
-        let std = (2.0 / N_EMBD as f32).sqrt();
+        // GPT-2 style initialization:
+        // - Input projections: std = 0.02
+        // - Output projections: std = 0.02 / sqrt(2 * N_LAYER)
+        // This accounts for residual branch accumulation
+        let std_in = 0.02;
+        let std_out = 0.02 / (2.0 * N_LAYER as f32).sqrt();
 
         Self {
-            wq: make_params(N_EMBD * N_EMBD, std),
-            wk: make_params(N_EMBD * N_EMBD, std),
-            wv: make_params(N_EMBD * N_EMBD, std),
-            wo: make_params(N_EMBD * N_EMBD, std),
-            fc1: make_params(MLP_DIM * N_EMBD, std),
-            fc2: make_params(N_EMBD * MLP_DIM, std / 2.0),
+            wq: make_params(N_EMBD * N_EMBD, std_in),
+            wk: make_params(N_EMBD * N_EMBD, std_in),
+            wv: make_params(N_EMBD * N_EMBD, std_in),
+            wo: make_params(N_EMBD * N_EMBD, std_out),  // Output projection
+            fc1: make_params(MLP_DIM * N_EMBD, std_in),
+            fc2: make_params(N_EMBD * MLP_DIM, std_out), // Output projection
 
             d_wq: zero_params(N_EMBD * N_EMBD),
             d_wk: zero_params(N_EMBD * N_EMBD),
@@ -238,9 +245,9 @@ impl GPTModel {
         let wpe_size = BLOCK_SIZE * N_EMBD;
         let lm_size = vocab_size * N_EMBD;
 
-        // Create layers first
+        // Create layers first (with GPT-2 style initialization)
         let layers: Vec<LayerWeights> = (0..N_LAYER)
-            .map(|_| LayerWeights::new(rng))
+            .map(|li| LayerWeights::new(rng, li))
             .collect();
 
         // Then create embedding params
@@ -525,7 +532,7 @@ fn backward_simple(
     // Backward through layers (simplified - just MLP for now)
     for li in (0..N_LAYER).rev() {
         // MLP backward
-        let mut d_mlp_out = d_x.clone();
+        let d_mlp_out = d_x.clone();
 
         // Clone weights to avoid borrow checker issues
         let fc2_weights = model.layers[li].fc2.clone();
@@ -579,14 +586,20 @@ fn backward_simple(
     }
 }
 
-// Learning rate schedule with cosine decay
+// Learning rate schedule: warmup + constant + decay
 fn get_learning_rate(iter: usize, max_iters: usize) -> f32 {
-    if iter < 100 {
+    let warmup_iters = 100;
+    let decay_start = (max_iters * 4) / 5;  // Start decay at 80%
+
+    if iter < warmup_iters {
         // Warmup: linearly increase from 10% to 100%
-        LEARNING_RATE * (0.1 + 0.9 * iter as f32 / 100.0)
+        LEARNING_RATE * (0.1 + 0.9 * iter as f32 / warmup_iters as f32)
+    } else if iter < decay_start {
+        // Constant: stay at max LR for most of training
+        LEARNING_RATE
     } else {
-        // Cosine decay from LEARNING_RATE to MIN_LEARNING_RATE
-        let progress = ((iter - 100) as f32) / ((max_iters - 100) as f32);
+        // Cosine decay: only in last 20% of training
+        let progress = ((iter - decay_start) as f32) / ((max_iters - decay_start) as f32);
         let cosine = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
         MIN_LEARNING_RATE + (LEARNING_RATE - MIN_LEARNING_RATE) * cosine
     }
@@ -608,7 +621,20 @@ fn clip_gradients(grads: &mut [f32], max_norm: f32) {
     }
 }
 
-// Adam optimizer step with learning rate
+// Dropout: randomly zero out elements during training
+fn apply_dropout(x: &mut [f32], dropout_rate: f32, rng: &mut Rng) {
+    let keep_prob = 1.0 - dropout_rate;
+    let scale = 1.0 / keep_prob;
+    for val in x.iter_mut() {
+        if rng.uniform() > dropout_rate as f64 {
+            *val *= scale;
+        } else {
+            *val = 0.0;
+        }
+    }
+}
+
+// Adam optimizer step with learning rate and weight decay (AdamW)
 fn adam_step(
     params: &mut [f32],
     grads: &[f32],
@@ -625,7 +651,8 @@ fn adam_step(
         let m_hat = m[i] / (1.0 - BETA1.powf(t_f));
         let v_hat = v[i] / (1.0 - BETA2.powf(t_f));
 
-        params[i] -= lr * m_hat / (v_hat.sqrt() + EPSILON);
+        // AdamW: decoupled weight decay
+        params[i] -= lr * (m_hat / (v_hat.sqrt() + EPSILON) + WEIGHT_DECAY * params[i]);
     }
 }
 
@@ -1239,6 +1266,18 @@ fn estimate_loss(
 /* Main                                                               */
 /* ------------------------------------------------------------------ */
 fn main() -> std::io::Result<()> {
+    // Parse command-line arguments
+    let args: Vec<String> = std::env::args().collect();
+
+    let iterations = if args.len() > 1 {
+        args[1].parse::<usize>().unwrap_or_else(|_| {
+            eprintln!("Invalid iterations argument. Using default: {}", MAX_ITERS);
+            MAX_ITERS
+        })
+    } else {
+        MAX_ITERS
+    };
+
     println!("=== Enhanced randyGPT ===");
     println!("Model: {} layers, {} heads, {} embedding dim", N_LAYER, N_HEAD, N_EMBD);
     println!("Block size: {}, Vocab size: up to {}", BLOCK_SIZE, MAX_VOCAB);
@@ -1298,7 +1337,7 @@ fn main() -> std::io::Result<()> {
     println!();
 
     // Train the model
-    train(&mut model, &data, MAX_ITERS, &mut rng);
+    train(&mut model, &data, iterations, &mut rng);
 
     // Estimate loss after training
     println!("Estimating final loss...");
@@ -1333,10 +1372,11 @@ fn main() -> std::io::Result<()> {
     println!("=== Summary ===");
     println!("✓ Data: {} chars, {} tokens", training_text.len(), data.len());
     println!("✓ Model: ~{:.2}M parameters", param_count as f32 / 1_000_000.0);
-    println!("✓ Trained: {} iterations", MAX_ITERS);
+    println!("✓ Trained: {} iterations", iterations);
     println!("✓ Loss improvement: {:.4} → {:.4}", initial_loss, final_loss);
     println!();
-    println!("Try editing the prompts in src/main.rs to generate different text!");
+    println!("Usage: {} [iterations]", args.get(0).unwrap_or(&"randygpt".to_string()));
+    println!("Example: {} 3000  (train for 3000 iterations)", args.get(0).unwrap_or(&"randygpt".to_string()));
 
     Ok(())
 }
