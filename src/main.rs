@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufRead, BufReader};
 use std::path::Path;
+use rayon::prelude::*;
 
 /* ------------------------------------------------------------------ */
 /* Enhanced Model hyper-parameters                                    */
@@ -20,7 +21,7 @@ const LEARNING_RATE: f32 = 3e-4;
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPSILON: f32 = 1e-8;
-const MAX_ITERS: usize = 200;  // Quick test run
+const MAX_ITERS: usize = 1000;  // Increased for better results
 const EVAL_INTERVAL: usize = 100;
 
 /* ------------------------------------------------------------------ */
@@ -599,59 +600,178 @@ fn zero_grads(model: &mut GPTModel) {
     }
 }
 
-// Training function
+// Struct to hold gradients for a single example
+#[derive(Clone)]
+struct GradientBuffer {
+    d_wte: Vec<f32>,
+    d_wpe: Vec<f32>,
+    d_lm_head: Vec<f32>,
+    d_fc1: Vec<Vec<f32>>,
+    d_fc2: Vec<Vec<f32>>,
+}
+
+impl GradientBuffer {
+    fn new(vocab_size: usize) -> Self {
+        Self {
+            d_wte: vec![0.0; vocab_size * N_EMBD],
+            d_wpe: vec![0.0; BLOCK_SIZE * N_EMBD],
+            d_lm_head: vec![0.0; vocab_size * N_EMBD],
+            d_fc1: vec![vec![0.0; MLP_DIM * N_EMBD]; N_LAYER],
+            d_fc2: vec![vec![0.0; N_EMBD * MLP_DIM]; N_LAYER],
+        }
+    }
+}
+
+// Training function with Rayon parallelization
 fn train(
     model: &mut GPTModel,
     data: &[usize],
     iterations: usize,
     rng: &mut Rng,
 ) {
-    println!("=== Starting Training ===");
+    println!("=== Starting Training (Multi-Core with Rayon) ===");
     println!("Iterations: {}", iterations);
     println!("Batch size: {}", BATCH_SIZE);
     println!("Learning rate: {}", LEARNING_RATE);
+    println!("Cores available: {}", rayon::current_num_threads());
     println!();
 
     let mut step = 0;
 
     for iter in 0..iterations {
+        // Generate batch indices (sequential, using our RNG)
+        let batch_starts: Vec<usize> = (0..BATCH_SIZE)
+            .filter_map(|_| {
+                if data.len() > BLOCK_SIZE + 1 {
+                    Some(rng.choice(data.len() - BLOCK_SIZE - 1))
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        if batch_starts.is_empty() {
+            continue;
+        }
+
+        // Wrap model in Mutex for thread-safe access (read-only during forward pass)
+        let model_ref = &*model;
+
+        // Process batch in parallel using Rayon
+        let results: Vec<_> = batch_starts
+            .par_iter()
+            .map(|&start_idx| {
+                let x_vec: Vec<usize> = data[start_idx..start_idx + BLOCK_SIZE].to_vec();
+                let y_vec: Vec<usize> = data[start_idx + 1..start_idx + BLOCK_SIZE + 1].to_vec();
+
+                // Forward pass
+                let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
+                    (0..N_LAYER).map(|_| Vec::new()).collect();
+                let (logits_seq, acts) = forward(&x_vec, model_ref, &mut kv_cache);
+
+                // Compute gradients (thread-local)
+                let last_pos = logits_seq.len() - 1;
+                let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
+
+                // Compute loss gradient
+                let mut probs = vec![0.0; model_ref.vocab_size];
+                softmax_fwd(&logits_seq[last_pos], model_ref.vocab_size, &mut probs, 1.0);
+                let loss = cross_entropy_loss(&probs, y_vec[last_pos]);
+
+                let mut d_logits = probs;
+                d_logits[y_vec[last_pos]] -= 1.0;
+
+                // Backward through lm_head
+                let mut d_x_out = vec![0.0; N_EMBD];
+                linear_bwd(
+                    &d_logits,
+                    &acts[last_pos].x_out,
+                    &model_ref.lm_head,
+                    model_ref.vocab_size,
+                    N_EMBD,
+                    &mut d_x_out,
+                    &mut local_grads.d_lm_head,
+                );
+
+                let mut d_x = d_x_out;
+
+                // Backward through layers (simplified - MLP only)
+                for li in (0..N_LAYER).rev() {
+                    let fc2_weights = model_ref.layers[li].fc2.clone();
+                    let fc1_weights = model_ref.layers[li].fc1.clone();
+
+                    let mut d_h2 = vec![0.0; MLP_DIM];
+                    linear_bwd(
+                        &d_x,
+                        &acts[last_pos].mlp_post[li],
+                        &fc2_weights,
+                        N_EMBD,
+                        MLP_DIM,
+                        &mut d_h2,
+                        &mut local_grads.d_fc2[li],
+                    );
+
+                    let mut d_h1 = vec![0.0; MLP_DIM];
+                    for i in 0..MLP_DIM {
+                        if acts[last_pos].mlp_pre[li][i] > 0.0 {
+                            d_h1[i] = d_h2[i] * 2.0 * acts[last_pos].mlp_pre[li][i];
+                        }
+                    }
+
+                    let mut d_xn_mlp = vec![0.0; N_EMBD];
+                    linear_bwd(
+                        &d_h1,
+                        &acts[last_pos].xn_mlp[li],
+                        &fc1_weights,
+                        MLP_DIM,
+                        N_EMBD,
+                        &mut d_xn_mlp,
+                        &mut local_grads.d_fc1[li],
+                    );
+
+                    for i in 0..N_EMBD {
+                        d_x[i] = d_xn_mlp[i] + d_x[i];
+                    }
+                }
+
+                // Backward into embeddings
+                for i in 0..N_EMBD {
+                    local_grads.d_wte[x_vec[last_pos] * N_EMBD + i] += d_x[i];
+                    local_grads.d_wpe[last_pos * N_EMBD + i] += d_x[i];
+                }
+
+                (local_grads, loss)
+            })
+            .collect();
+
+        // Aggregate gradients (sequential)
         zero_grads(model);
         let mut batch_loss = 0.0;
 
-        // Mini-batch
-        for _ in 0..BATCH_SIZE {
-            if data.len() <= BLOCK_SIZE + 1 {
-                continue;
+        for (grads, loss) in results {
+            batch_loss += loss;
+
+            // Accumulate gradients
+            for i in 0..model.d_wte.len() {
+                model.d_wte[i] += grads.d_wte[i];
             }
-
-            // Sample random sequence
-            let start_idx = rng.choice(data.len() - BLOCK_SIZE - 1);
-            let x = &data[start_idx..start_idx + BLOCK_SIZE];
-            let y = &data[start_idx + 1..start_idx + BLOCK_SIZE + 1];
-
-            // Forward pass
-            let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
-                (0..N_LAYER).map(|_| Vec::new()).collect();
-            let (logits_seq, acts) = forward(x, model, &mut kv_cache);
-
-            // Backward pass (only on last position)
-            let last_pos = logits_seq.len() - 1;
-            backward_simple(
-                &logits_seq[last_pos],
-                y[last_pos],
-                &acts[last_pos],
-                model,
-                x[last_pos],
-                last_pos,
-            );
-
-            // Accumulate loss
-            let mut probs = vec![0.0; model.vocab_size];
-            softmax_fwd(&logits_seq[last_pos], model.vocab_size, &mut probs, 1.0);
-            batch_loss += cross_entropy_loss(&probs, y[last_pos]);
+            for i in 0..model.d_wpe.len() {
+                model.d_wpe[i] += grads.d_wpe[i];
+            }
+            for i in 0..model.d_lm_head.len() {
+                model.d_lm_head[i] += grads.d_lm_head[i];
+            }
+            for li in 0..N_LAYER {
+                for i in 0..model.layers[li].d_fc1.len() {
+                    model.layers[li].d_fc1[i] += grads.d_fc1[li][i];
+                }
+                for i in 0..model.layers[li].d_fc2.len() {
+                    model.layers[li].d_fc2[i] += grads.d_fc2[li][i];
+                }
+            }
         }
 
-        batch_loss /= BATCH_SIZE as f32;
+        batch_loss /= batch_starts.len() as f32;
         step += 1;
 
         // Optimizer step
