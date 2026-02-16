@@ -17,12 +17,12 @@ const MAX_VOCAB: usize = 512;     // Support more characters/tokens
 
 // Training parameters
 const BATCH_SIZE: usize = 32;
-const LEARNING_RATE: f32 = 3e-4;
-const MIN_LEARNING_RATE: f32 = 3e-5;  // Decay to 10% of initial
+const LEARNING_RATE: f32 = 3e-5;      // Compensate for 64x more grad updates
+const MIN_LEARNING_RATE: f32 = 3e-6;  // Decay to 10% of initial
 const BETA1: f32 = 0.9;
 const BETA2: f32 = 0.999;
 const EPSILON: f32 = 1e-8;
-const MAX_ITERS: usize = 1000;  // Increased for better results
+const MAX_ITERS: usize = 1000;
 const EVAL_INTERVAL: usize = 100;
 const GRAD_CLIP: f32 = 1.0;  // Gradient clipping threshold
 
@@ -705,75 +705,80 @@ fn train(
                 let (logits_seq, acts) = forward(&x_vec, model_ref, &mut kv_cache);
 
                 // Compute gradients (thread-local)
-                let last_pos = logits_seq.len() - 1;
                 let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
+                let mut total_loss = 0.0;
 
-                // Compute loss gradient
-                let mut probs = vec![0.0; model_ref.vocab_size];
-                softmax_fwd(&logits_seq[last_pos], model_ref.vocab_size, &mut probs, 1.0);
-                let loss = cross_entropy_loss(&probs, y_vec[last_pos]);
+                // Train on ALL positions (not just last) - 64x more training signal!
+                for pos in 0..logits_seq.len() {
+                    // Compute loss gradient for this position
+                    let mut probs = vec![0.0; model_ref.vocab_size];
+                    softmax_fwd(&logits_seq[pos], model_ref.vocab_size, &mut probs, 1.0);
+                    total_loss += cross_entropy_loss(&probs, y_vec[pos]);
 
-                let mut d_logits = probs;
-                d_logits[y_vec[last_pos]] -= 1.0;
+                    let mut d_logits = probs;
+                    d_logits[y_vec[pos]] -= 1.0;
 
-                // Backward through lm_head
-                let mut d_x_out = vec![0.0; N_EMBD];
-                linear_bwd(
-                    &d_logits,
-                    &acts[last_pos].x_out,
-                    &model_ref.lm_head,
-                    model_ref.vocab_size,
-                    N_EMBD,
-                    &mut d_x_out,
-                    &mut local_grads.d_lm_head,
-                );
-
-                let mut d_x = d_x_out;
-
-                // Backward through layers (simplified - MLP only)
-                for li in (0..N_LAYER).rev() {
-                    let fc2_weights = model_ref.layers[li].fc2.clone();
-                    let fc1_weights = model_ref.layers[li].fc1.clone();
-
-                    let mut d_h2 = vec![0.0; MLP_DIM];
+                    // Backward through lm_head
+                    let mut d_x_out = vec![0.0; N_EMBD];
                     linear_bwd(
-                        &d_x,
-                        &acts[last_pos].mlp_post[li],
-                        &fc2_weights,
+                        &d_logits,
+                        &acts[pos].x_out,
+                        &model_ref.lm_head,
+                        model_ref.vocab_size,
                         N_EMBD,
-                        MLP_DIM,
-                        &mut d_h2,
-                        &mut local_grads.d_fc2[li],
+                        &mut d_x_out,
+                        &mut local_grads.d_lm_head,
                     );
 
-                    let mut d_h1 = vec![0.0; MLP_DIM];
-                    for i in 0..MLP_DIM {
-                        if acts[last_pos].mlp_pre[li][i] > 0.0 {
-                            d_h1[i] = d_h2[i] * 2.0 * acts[last_pos].mlp_pre[li][i];
+                    let mut d_x = d_x_out;
+
+                    // Backward through layers (simplified - MLP only)
+                    for li in (0..N_LAYER).rev() {
+                        let fc2_weights = model_ref.layers[li].fc2.clone();
+                        let fc1_weights = model_ref.layers[li].fc1.clone();
+
+                        let mut d_h2 = vec![0.0; MLP_DIM];
+                        linear_bwd(
+                            &d_x,
+                            &acts[pos].mlp_post[li],
+                            &fc2_weights,
+                            N_EMBD,
+                            MLP_DIM,
+                            &mut d_h2,
+                            &mut local_grads.d_fc2[li],
+                        );
+
+                        let mut d_h1 = vec![0.0; MLP_DIM];
+                        for i in 0..MLP_DIM {
+                            if acts[pos].mlp_pre[li][i] > 0.0 {
+                                d_h1[i] = d_h2[i] * 2.0 * acts[pos].mlp_pre[li][i];
+                            }
+                        }
+
+                        let mut d_xn_mlp = vec![0.0; N_EMBD];
+                        linear_bwd(
+                            &d_h1,
+                            &acts[pos].xn_mlp[li],
+                            &fc1_weights,
+                            MLP_DIM,
+                            N_EMBD,
+                            &mut d_xn_mlp,
+                            &mut local_grads.d_fc1[li],
+                        );
+
+                        for i in 0..N_EMBD {
+                            d_x[i] = d_xn_mlp[i] + d_x[i];
                         }
                     }
 
-                    let mut d_xn_mlp = vec![0.0; N_EMBD];
-                    linear_bwd(
-                        &d_h1,
-                        &acts[last_pos].xn_mlp[li],
-                        &fc1_weights,
-                        MLP_DIM,
-                        N_EMBD,
-                        &mut d_xn_mlp,
-                        &mut local_grads.d_fc1[li],
-                    );
-
+                    // Backward into embeddings
                     for i in 0..N_EMBD {
-                        d_x[i] = d_xn_mlp[i] + d_x[i];
+                        local_grads.d_wte[x_vec[pos] * N_EMBD + i] += d_x[i];
+                        local_grads.d_wpe[pos * N_EMBD + i] += d_x[i];
                     }
                 }
 
-                // Backward into embeddings
-                for i in 0..N_EMBD {
-                    local_grads.d_wte[x_vec[last_pos] * N_EMBD + i] += d_x[i];
-                    local_grads.d_wpe[last_pos * N_EMBD + i] += d_x[i];
-                }
+                let loss = total_loss / logits_seq.len() as f32;
 
                 (local_grads, loss)
             })
