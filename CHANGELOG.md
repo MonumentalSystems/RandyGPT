@@ -2,6 +2,19 @@
 
 All notable changes to randyGPT are documented here.
 
+## [0.7.0] - 2026-02-16
+
+### Accelerate BLAS for CPU Matrix Ops (~2× training speedup)
+
+- **`linear_fwd`**: replaced manual dot-product loop with `cblas_sgemv` (matrix-vector multiply)
+- **`linear_bwd`**: replaced double loop with `cblas_sgemv` (W^T · d_out) + `cblas_sger` (outer-product update for d_w)
+- Both use Apple's Accelerate framework — always available on macOS, no additional dependencies
+- `build.rs` added to emit `cargo:rustc-link-lib=framework=Accelerate`
+- **Measured speedup**: ~215s/1000 iter (down from ~450s) — **2.1× faster**
+- All other compute paths unchanged; Metal inference path unaffected
+
+---
+
 ## [0.6.0] - 2026-02-16
 
 ### Full Attention Gradients + Validation Tracking + Module Refactor

@@ -4,20 +4,62 @@
 
 use crate::rng::Rng;
 
+// ── BLAS FFI (Accelerate framework on macOS) ──────────────────────
+// cblas_sgemv: matrix-vector multiply
+// cblas_sger:  rank-1 outer-product update
+#[allow(non_camel_case_types)]
+mod blas {
+    type c_int = i32;
+    type c_float = f32;
+
+    // CBLAS_ORDER / CBLAS_TRANSPOSE values
+    pub const ROW_MAJOR: c_int = 101;
+    pub const NO_TRANS:  c_int = 111;
+    pub const TRANS:     c_int = 112;
+
+    extern "C" {
+        // y = alpha * A * x + beta * y   (or A^T * x when trans=TRANS)
+        pub fn cblas_sgemv(
+            order: c_int, trans: c_int,
+            m: c_int, n: c_int,
+            alpha: c_float,
+            a: *const c_float, lda: c_int,
+            x: *const c_float, incx: c_int,
+            beta: c_float,
+            y: *mut c_float, incy: c_int,
+        );
+
+        // A += alpha * x * y^T   (outer-product update)
+        pub fn cblas_sger(
+            order: c_int,
+            m: c_int, n: c_int,
+            alpha: c_float,
+            x: *const c_float, incx: c_int,
+            y: *const c_float, incy: c_int,
+            a: *mut c_float, lda: c_int,
+        );
+    }
+}
+
 // Linear forward: out[nout] = W[nout×nin] · x[nin]
-// Always CPU — Metal is used only in batched inference (forward_metal_logits).
-// Per-vector Metal calls allocate GPU memory tens of thousands of times per
-// iteration, causing memory exhaustion. Batched matmuls are used instead.
+// Uses cblas_sgemv for the matrix-vector product.
 pub fn linear_fwd(x: &[f32], w: &[f32], nout: usize, nin: usize, out: &mut [f32]) {
-    for r in 0..nout {
-        // zip-based dot product — LLVM can auto-vectorize with SIMD
-        out[r] = w[r * nin..(r + 1) * nin].iter().zip(x.iter()).map(|(wi, xi)| wi * xi).sum();
+    unsafe {
+        blas::cblas_sgemv(
+            blas::ROW_MAJOR, blas::NO_TRANS,
+            nout as i32, nin as i32,
+            1.0,
+            w.as_ptr(), nin as i32,
+            x.as_ptr(), 1,
+            0.0,
+            out.as_mut_ptr(), 1,
+        );
     }
 }
 
 // Linear backward:
-//   d_w[r,c] += d_out[r] * x[c]
-//   d_x[c]   += d_out[r] * w[r,c]
+//   d_x[nin]       = W^T · d_out           (cblas_sgemv with TRANS)
+//   d_w[nout×nin] += d_out ⊗ x             (cblas_sger outer product)
 pub fn linear_bwd(
     d_out: &[f32],
     x: &[f32],
@@ -27,12 +69,27 @@ pub fn linear_bwd(
     d_x: &mut [f32],
     d_w: &mut [f32],
 ) {
-    d_x[..nin].fill(0.0);
-    for r in 0..nout {
-        for c in 0..nin {
-            d_w[r * nin + c] += d_out[r] * x[c];
-            d_x[c]           += d_out[r] * w[r * nin + c];
-        }
+    unsafe {
+        // d_x = W^T · d_out
+        blas::cblas_sgemv(
+            blas::ROW_MAJOR, blas::TRANS,
+            nout as i32, nin as i32,
+            1.0,
+            w.as_ptr(), nin as i32,
+            d_out.as_ptr(), 1,
+            0.0,
+            d_x.as_mut_ptr(), 1,
+        );
+
+        // d_w += d_out ⊗ x  (accumulate — alpha=1.0)
+        blas::cblas_sger(
+            blas::ROW_MAJOR,
+            nout as i32, nin as i32,
+            1.0,
+            d_out.as_ptr(), 1,
+            x.as_ptr(), 1,
+            d_w.as_mut_ptr(), nin as i32,
+        );
     }
 }
 
