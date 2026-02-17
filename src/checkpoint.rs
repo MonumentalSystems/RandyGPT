@@ -170,6 +170,54 @@ pub fn load_checkpoint(
     Ok((iter + 1, step, best_loss))
 }
 
+/// Load weights from any checkpoint format (v1/v2/v3) into a CPU GPTModel.
+/// Ignores optimizer moments. Useful for --generate mode.
+pub fn load_checkpoint_cpu(
+    path: &str,
+    model: &mut GPTModel,
+) -> std::io::Result<(usize, usize, f32)> {
+    let mut f = File::open(path)?;
+
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != b"RGPT0001" && &magic != b"RGPT0002" && &magic != b"RGPT0003" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Unknown checkpoint format in '{}': {:?}", path, magic),
+        ));
+    }
+
+    let mut u32buf = [0u8; 4];
+    f.read_exact(&mut u32buf)?; let ckpt_vocab = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let iter       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let step       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let best_loss  = f32::from_le_bytes(u32buf);
+
+    if ckpt_vocab != model.vocab_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
+        ));
+    }
+
+    // Weight layout is identical across v1/v2/v3
+    model.wte     = read_f32_slice(&mut f, model.wte.len())?;
+    model.wpe     = read_f32_slice(&mut f, model.wpe.len())?;
+    model.lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+    }
+    // Skip moments — not needed for inference
+
+    Ok((iter + 1, step, best_loss))
+}
+
 // ── RGPT0002: CandleModel checkpoint (same binary layout, new magic) ──
 
 /// Serialize a CandleModel to in-memory bytes (RGPT0002 format).

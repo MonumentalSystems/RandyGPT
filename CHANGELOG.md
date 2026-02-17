@@ -23,7 +23,7 @@ All notable changes to randyGPT are documented here.
 | **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
 | **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 |
 | **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** |
-| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | TBD (BPE) |
+| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | **87.1** (BPE†) |
 | **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 |
 
 †RSS ~1GB real at T=256; Activity Monitor shows 4-8GB (Metal unified memory pool — not CPU-resident)
@@ -31,6 +31,55 @@ All notable changes to randyGPT are documented here.
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+†BPE ppl 87.1 ≈ char-equiv ppl ~1.7 — not directly comparable to char-level ppl (see v0.9.2 notes)
+
+---
+
+## [0.9.3] - 2026-02-17
+
+### Model Architecture Experiments + Infrastructure
+
+#### New Model Presets
+- **model-xs** (116-dim, 4H, 3L, ~746K params) — matched friend's "Alpha GPT" architecture for comparison
+- **model-deep** (192-dim, 6H, **16L**, ~7.5M params) — depth experiment: same width as model-M but 2.7× deeper
+- **model-S updated**: 4 layers → **8 layers** (128-dim, 4H, 8L, ~1.6M params) — double depth, same width
+
+#### BPE-500 Vocabulary Optimization
+- Smaller vocab = more params for transformer, less for embeddings
+- model-XS at BPE-500: embedding table = 8% of params (vs 31% at BPE-2000)
+- BPE-500 ppl not comparable to BPE-2000 ppl (different prediction difficulty)
+
+#### Model-XS BPE-500 Results (Shakespeare 7.6MB)
+| Run | Iters | Best PPL | Best Loss | Notes |
+|-----|-------|----------|-----------|-------|
+| 1st 1K | 1000 | 100.0 | 4.6149 | LR exhausted at min |
+| +850 (early stop) | 1850 | 66.5 | 4.1968 | LR restart helped |
+
+#### Model-Deep Results (Gutenberg 106MB, BPE-500)
+| Phase | Iters | Best PPL | Best Loss | LR | Notes |
+|-------|-------|----------|-----------|-----|-------|
+| Shakespeare 7.6MB | 1850 | 68.3 | 4.2232 | 3e-5 | baseline |
+| Gutenberg 41MB | 2000 | 52.1 | 3.9456 | 3e-5 | 2.5× data helped |
+| +resume 41MB | 4300 | 39.3 | 3.6677 | 3e-5 | early stopped |
+| +lower LR | 5800 | 37.1 | 3.6139 | 1e-5 | continued improving |
+| Gutenberg 106MB | 4300 | 38.5 | 3.6514 | 3e-5 | more data, early stopped |
+| +lower LR 106MB | ongoing | ~37 | ~3.61 | 1e-5 | still running |
+
+#### Key Findings
+- **Depth vs width**: 16L×192-dim (7.5M) reached ppl 37 vs model-L 6L×256-dim (4.82M) at ppl 87 (BPE-2000). Not directly comparable due to different vocab sizes, but depth clearly helps for coherence.
+- **BPE vocab size matters at small scale**: BPE-500 gave better results than BPE-1000 on model-XS because more params went to the transformer instead of embeddings.
+- **Data scaling**: 106MB Gutenberg (55M tokens) vs 7.6MB Shakespeare (3.9M tokens) — more diverse data is harder to model but produces better generalization. Model-deep plateaued around ppl 37 on 106MB.
+- **GRAD_ACCUM_STEPS > 1 causes Metal GPU stalls** — system freezes ~10s, interrupts blocked. Kept at 1 for all models.
+- **Batch size 256 for model-XS used 8GB+** — activation memory dominates over weight memory. Reduced to B=64.
+- **Batch size 32 for model-deep used 31GB/24GB** — into swap, 2× slower. Reduced to B=16, runs at 14GB/870ms.
+
+#### Infrastructure Improvements
+- **Token cache** (`tokens.bin`): saves tokenized corpus as binary u32 array. First run tokenizes and caches; subsequent runs load instantly (~1s vs 30s+ for 106MB corpus). Delete when changing data or vocab.
+- **Fast `--generate` mode**: skips train.txt loading, tokenization, and Metal GPU init entirely. CPU-only inference from vocab.json + checkpoint. Memory: ~100MB vs 42GB previously.
+- **`load_checkpoint_cpu()`**: reads weights from any checkpoint format (RGPT0001/0002/0003) into CPU GPTModel, ignoring optimizer moments. Used by `--generate`.
+- **`generate_cpu()`**: force-CPU forward path, avoids triggering Metal lazy_static init.
+- **EVAL_INTERVAL**: 10 → 25 — reduces eval overhead ~10%, fewer GPU stalls from train/eval sync.
+- **Gutenberg download script** (`scripts/download_gutenberg.sh`): downloads 100+ public domain novels, concatenates to training file. 106MB, 19M words, 55M BPE-500 tokens.
 
 ---
 
@@ -59,12 +108,43 @@ All notable changes to randyGPT are documented here.
 ./randygpt --bpe 3000 --iters 3000
 ```
 
-#### Early BPE Results (model-L, 2000 tokens, in progress)
-- Initial ppl ~2000 (full vocab entropy: log(2000) ≈ 7.6 nats) — expected for fresh init
-- iter 100: ppl 663, iter 200: ppl 416, iter 250: ppl 318 — steep descent, patience resetting every eval
-- Generation at iter 100 already shows real Shakespeare words ("hath", "father", "speak", "friend") vs char-level noise at same iter count
-- Speed: ~1870ms/iter (same as char-level — wte/lm_head are larger but GPU-bound compute unchanged)
-- Full results TBD when 3000-iter run completes
+#### BPE Results (model-L, 2000 tokens, 3000 iters)
+
+| Iter | BPE ppl | ~Char-equiv ppl | LR | Notes |
+|------|---------|-----------------|-----|-------|
+| 300 | 260.1 | ~4.0 | 3e-5 | steep descent |
+| 500 | 198.7 | ~3.1 | 3e-5 | broke below 200 |
+| 1000 | 149.1 | ~3.0 | 3e-6 | 1K run complete |
+| 2350 | 91.2 | ~1.8 | 1.8e-5 | new best <100 |
+| 2570 | 89.9 | ~1.8 | 1.1e-5 | first sub-90 |
+| **3000** | **87.1** | **~1.7** | 3e-6 | **final best** |
+
+- Best val loss: **4.4667 (ppl 87.1)** — char-equivalent ppl ~1.7, roughly **6× better** than best char-level run (ppl 10.6)
+- Final val: ppl 92.6, final train: 4.36
+- Speed: ~1907ms/iter (same as char-level)
+- BPE ppl not directly comparable to char ppl — BPE predicts over 2000 tokens vs 117 chars; divide BPE loss by ~4.5 chars/token for char-equivalent
+
+##### Generation at iter 3000 (BPE ppl 87.1)
+```
+ROMEO:
+Or some. How, then, what we pardonice; you?
+Scene II. The He will give the d
+
+To be or not to bey;
+Here's your husband; things of mine and garden,
+And this bless to ge, if seeming and Me
+And must I confin wisly must be thank.
+
+Once upon a time.
+That sweet King of liver not ted;
+How now, IUS: He says in God, bedevil speak.
+Nay, know him, if you there which I garded
+```
+
+##### Generation comparison: char-level ppl 10.6 vs BPE ppl 87.1
+- **Char-level (ppl 10.6)**: correctly spelled words, but no multi-word coherence beyond common bigrams
+- **BPE (ppl 87.1)**: real phrases ("Here's your husband", "things of mine and garden", "Nay, know him"), Shakespeare register ("sweet King", "must I confin"), scene directions ("Scene II.") — but still garbled fragments between coherent stretches
+- **Verdict**: BPE model produces noticeably more coherent Shakespeare despite "higher" raw ppl number — confirms BPE ppl and char ppl measure fundamentally different things
 
 ---
 
@@ -599,8 +679,17 @@ Cores used: 12 available, ~8 effectively utilized
 - [x] **model-M (2.7M) + 7.6MB** — tested (ppl 12.5 at iter 1000, fragmented schedule)
 - [x] **model-L (4.82M) + 7.6MB** — char-level ceiling confirmed at ppl 11.6; more data alone insufficient
 - [x] **BPE tokenization** — `--bpe [N]` flag, 2000-token vocab, heap-based training ~15s, parallel encoding
-- [ ] **BPE 3000-iter run to completion** — target: first coherent multi-word Shakespeare phrases ← **running now**
+- [x] **BPE 3000-iter run** — best ppl 87.1 (char-equiv ~1.7); coherent Shakespeare phrases confirmed
+- [x] **model-xs** (116-dim, 4H, 3L, ~746K) — BPE-500 experiments, ppl 66.5 on Shakespeare
+- [x] **model-deep** (192-dim, 6H, 16L, ~7.5M) — depth experiment, ppl 37.1 on 106MB Gutenberg
+- [x] **model-S updated** to 8 layers (128-dim, 4H, 8L, ~1.6M) — deeper small model
+- [x] **Token cache** (`tokens.bin`) — binary cache skips re-tokenization on resume
+- [x] **Fast `--generate`** — CPU-only inference, skips data loading and Metal init
+- [x] **`load_checkpoint_cpu`** — reads any checkpoint format (v1/v2/v3) for CPU inference
+- [x] **Gutenberg corpus** — 106MB, 100+ public domain novels, ~55M BPE-500 tokens
+- [x] **EVAL_INTERVAL** bumped to 25 (from 10) — less eval overhead, ~10% faster training
 - [ ] Mixed precision (f16) training on Metal
+- [ ] KV cache for generation
 
 ---
 

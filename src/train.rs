@@ -70,6 +70,31 @@ pub fn generate(
     top_p: f32,
     rng: &mut Rng,
 ) -> String {
+    generate_inner(model, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, false)
+}
+
+pub fn generate_cpu(
+    model: &GPTModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    rng: &mut Rng,
+) -> String {
+    generate_inner(model, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, true)
+}
+
+fn generate_inner(
+    model: &GPTModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    rng: &mut Rng,
+    force_cpu: bool,
+) -> String {
     let mut tokens = tokenizer.encode(prompt);
     let max_len = BLOCK_SIZE.min(tokens.len() + max_new_tokens);
 
@@ -79,7 +104,7 @@ pub fn generate(
     while tokens.len() < max_len {
         let logits_seq_metal;
         let logits_seq_cpu;
-        let logits = if METAL_DEVICE.is_some() {
+        let logits = if !force_cpu && METAL_DEVICE.is_some() {
             logits_seq_metal = forward_metal_logits(&tokens, model);
             &logits_seq_metal[logits_seq_metal.len() - 1]
         } else {
