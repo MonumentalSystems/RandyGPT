@@ -3,7 +3,7 @@
 /* ------------------------------------------------------------------ */
 
 // Model architecture
-pub const N_EMBD: usize = 128;
+pub const N_EMBD: usize = 256;
 pub const N_HEAD: usize = 8;
 pub const N_LAYER: usize = 6;
 pub const BLOCK_SIZE: usize = 64;
