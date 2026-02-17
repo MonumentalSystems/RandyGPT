@@ -29,7 +29,7 @@ All notable changes to randyGPT are documented here.
 †RSS ~400MB real; Activity Monitor shows ~3GB (Metal unified memory in virtual space — not CPU-resident)
 ‡Estimated
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
-¶Candle Metal autograd (~490ms/iter steady-state, ~2× vs v0.7.1 CPU); batch=128; 60.9% GPU utilization
+¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
 
 ---
@@ -38,7 +38,7 @@ All notable changes to randyGPT are documented here.
 
 ### Candle Autograd Metal Training (Strategy A Hybrid)
 
-#### GPU Training via Candle Autograd (~3.4× speedup)
+#### GPU Training via Candle Autograd (~2× speedup)
 - **Forward and backward passes now run on Metal GPU** via Candle autograd
 - New `CandleModel` / `CandleLayer` structs: all weights stored as `candle_core::Var` on Metal device
 - New `forward_candle_train()`: fully batched `[BATCH_SIZE, BLOCK_SIZE, N_EMBD]` forward pass using Candle tensor ops
@@ -48,7 +48,18 @@ All notable changes to randyGPT are documented here.
 - `loss.backward()` → `GradStore` replaces hand-written two-pass SGEMM backward
 - **Optimizer stays on CPU (Strategy A)**: AdamW moments remain `Vec<f32>`, `adam_step()` reused unchanged
 - Gradients pulled off GPU via `.flatten_all().to_vec1::<f32>()`, clipped, Adam-updated, re-uploaded via `Var::set()`
-- **Measured speedup**: ~490ms/iter steady-state vs ~964ms/iter (v0.7.1 CPU) = **~2×**; 60.9% GPU utilization
+- **Measured speedup**: ~488ms/iter steady-state vs ~964ms/iter (v0.7.1 CPU) = **~2×**; 60.9% GPU utilization
+
+#### Confirmed 1000-Iteration Results (Shakespeare, 4.77M params)
+| Metric | Value |
+|--------|-------|
+| Avg ms/iter | 488ms |
+| Total time (500 iters) | 245s |
+| Val loss @ iter 1000 | 2.38 |
+| Val perplexity @ iter 1000 | 10.8 |
+| Best val loss | 2.25 @ iter 962 |
+| GPU utilization | 60.9% |
+| RSS (real) | ~400 MB |
 
 #### RGPT0002 Checkpoint Format
 - New magic bytes `b"RGPT0002"` — incompatible with prior RGPT0001 checkpoints
