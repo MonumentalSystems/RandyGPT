@@ -57,7 +57,7 @@ Two checkpoint files are maintained:
 
 **What's saved**: Model weights + full AdamW optimizer state (m/v moments) + iteration/step counters. The LR schedule resumes exactly where it left off.
 
-**File size**: ~55 MB for the current 4.77M-param config (scales with param count). Uses RGPT0002 binary format.
+**File size**: ~55 MB for the current 4.82M-param config (scales with param count). Uses RGPT0003 binary format (weights + full GPU AdamW moments).
 
 **Ctrl-C**: Pressing Ctrl-C mid-training saves both checkpoints before exiting:
 ```
@@ -158,7 +158,7 @@ On M-series Macs, Metal is used automatically for the entire training loop — y
 Metal GPU: enabled — training via Candle autograd
 ```
 
-The forward pass, backward pass (Candle autograd), and weight uploads all run on GPU. AdamW optimizer moments stay on CPU (`Vec<f32>`) — gradients are pulled off GPU, clipped, updated, and re-uploaded each iteration.
+The forward pass, backward pass (Candle autograd), and AdamW optimizer (moments as Metal `Var` tensors) all run on GPU — zero CPU transfers in the hot loop.
 
 If Metal is unavailable (non-Apple hardware or driver issue), the code falls back to CPU (Rayon + Accelerate BLAS) transparently.
 
