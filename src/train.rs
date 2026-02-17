@@ -158,6 +158,9 @@ pub fn train(
     let train_start  = Instant::now();
     let mut iter_count = 0u64;       // iterations actually executed this session
     let mut total_iter_ms = 0u64;    // cumulative wall time for those iterations
+    let mut best_val_loss  = f32::INFINITY;
+    let mut patience_count = 0usize;
+    let mut stop_early     = false;
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
@@ -512,11 +515,30 @@ pub fn train(
             let timing  = format!("{:.0}ms/iter | {:.0}s elapsed | ETA {:.0}s", avg_ms, elapsed, eta_s);
 
             if !val_data.is_empty() {
-                let val_loss = estimate_loss(model, val_data, 10, rng);
+                let val_loss = estimate_loss(model, val_data, 50, rng);
                 let val_ppl  = val_loss.exp();
+
+                // Early stopping patience check
+                if EARLY_STOP_PATIENCE > 0 {
+                    if val_loss < best_val_loss {
+                        best_val_loss  = val_loss;
+                        patience_count = 0;
+                    } else {
+                        patience_count += 1;
+                        if patience_count >= EARLY_STOP_PATIENCE {
+                            stop_early = true;
+                        }
+                    }
+                }
+
+                let patience_str = if EARLY_STOP_PATIENCE > 0 {
+                    format!(" | Patience: {}/{}", patience_count, EARLY_STOP_PATIENCE)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}",
-                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}{}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing, patience_str
                 );
             } else {
                 println!(
@@ -526,6 +548,26 @@ pub fn train(
             }
             ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
             if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
+
+            // Early stopping break
+            if stop_early {
+                let elapsed = train_start.elapsed().as_secs_f32();
+                let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+                println!();
+                println!("Early stopping: val loss hasn't improved for {} eval intervals ({} iters).",
+                    EARLY_STOP_PATIENCE, EARLY_STOP_PATIENCE * EVAL_INTERVAL);
+                println!("Best val loss was {:.4}. Saving checkpoint and stopping.", best_val_loss);
+                println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
+                flush_checkpoint("checkpoint.bin", &ckpt_buf)
+                    .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                    .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+                if !ckpt_best_buf.is_empty() {
+                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                        .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                        .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+                }
+                return;
+            }
         }
 
         // Ctrl-C: flush and exit
@@ -600,6 +642,9 @@ pub fn train_candle(
     let train_start    = Instant::now();
     let mut iter_count = 0u64;
     let mut total_iter_ms = 0u64;
+    let mut best_val_loss   = f32::INFINITY;  // tracks val loss for early stopping
+    let mut patience_count  = 0usize;         // consecutive evals with no val improvement
+    let mut stop_early      = false;
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
@@ -661,11 +706,30 @@ pub fn train_candle(
             if !val_data.is_empty() {
                 // Use CPU model for val loss (forward_metal_logits path unchanged)
                 let cpu_model = model.to_gpt().unwrap_or_else(|e| panic!("to_gpt: {}", e));
-                let val_loss = estimate_loss(&cpu_model, val_data, 10, rng);
+                let val_loss = estimate_loss(&cpu_model, val_data, 50, rng);
                 let val_ppl  = val_loss.exp();
+
+                // Early stopping patience check
+                if EARLY_STOP_PATIENCE > 0 {
+                    if val_loss < best_val_loss {
+                        best_val_loss  = val_loss;
+                        patience_count = 0;
+                    } else {
+                        patience_count += 1;
+                        if patience_count >= EARLY_STOP_PATIENCE {
+                            stop_early = true;
+                        }
+                    }
+                }
+
+                let patience_str = if EARLY_STOP_PATIENCE > 0 {
+                    format!(" | Patience: {}/{}", patience_count, EARLY_STOP_PATIENCE)
+                } else {
+                    String::new()
+                };
                 println!(
-                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}",
-                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}{}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing, patience_str
                 );
             } else {
                 println!(
@@ -676,6 +740,26 @@ pub fn train_candle(
 
             ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_loss);
             if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
+
+            // ── Early stopping ────────────────────────────────────────
+            if stop_early {
+                let elapsed = train_start.elapsed().as_secs_f32();
+                let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+                println!();
+                println!("Early stopping: val loss hasn't improved for {} eval intervals ({} iters).",
+                    EARLY_STOP_PATIENCE, EARLY_STOP_PATIENCE * EVAL_INTERVAL);
+                println!("Best val loss was {:.4}. Saving checkpoint and stopping.", best_val_loss);
+                println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
+                flush_checkpoint("checkpoint.bin", &ckpt_buf)
+                    .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                    .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+                if !ckpt_best_buf.is_empty() {
+                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                        .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                        .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+                }
+                return;
+            }
         }
 
         // ── Ctrl-C ────────────────────────────────────────────────────

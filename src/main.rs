@@ -213,8 +213,8 @@ fn main() -> std::io::Result<()> {
 
     // ── Initial loss estimate ─────────────────────────────────────────
     println!("Estimating initial loss...");
-    let initial_loss     = estimate_loss(&model, &data, 10, &mut rng);
-    let initial_val_loss = estimate_loss(&model, &val_data, 10, &mut rng);
+    let initial_loss     = estimate_loss(&model, &data, 50, &mut rng);
+    let initial_val_loss = estimate_loss(&model, &val_data, 50, &mut rng);
     println!("Initial loss: {:.4} | Val: {:.4} (ppl {:.1})",
         initial_loss, initial_val_loss, initial_val_loss.exp());
     println!();
@@ -253,8 +253,8 @@ fn main() -> std::io::Result<()> {
 
     // ── Final loss estimate ───────────────────────────────────────────
     println!("Estimating final loss...");
-    let final_loss     = estimate_loss(&model, &data, 10, &mut rng);
-    let final_val_loss = estimate_loss(&model, &val_data, 10, &mut rng);
+    let final_loss     = estimate_loss(&model, &data, 50, &mut rng);
+    let final_val_loss = estimate_loss(&model, &val_data, 50, &mut rng);
     println!("Final train loss: {:.4} (started {:.4})", final_loss, initial_loss);
     println!("Final val loss:   {:.4} (ppl {:.1}, started {:.4})",
         final_val_loss, final_val_loss.exp(), initial_val_loss);

@@ -21,8 +21,12 @@ pub const BETA1: f32 = 0.9;
 pub const BETA2: f32 = 0.999;
 pub const EPSILON: f32 = 1e-8;
 pub const MAX_ITERS: usize = 1000;
-pub const EVAL_INTERVAL: usize = 100;
+pub const EVAL_INTERVAL: usize = 10;
 pub const GRAD_CLIP: f32 = 1.0;
+// Early stopping: halt if val loss hasn't improved for this many eval intervals.
+// Set to 0 to disable. E.g. with EVAL_INTERVAL=100 and patience=5 → stops after
+// 500 consecutive iters with no val improvement.
+pub const EARLY_STOP_PATIENCE: usize = 10;
 
 // Metal
 pub const USE_METAL: bool = true;
