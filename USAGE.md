@@ -57,7 +57,7 @@ Two checkpoint files are maintained:
 
 **What's saved**: Model weights + full AdamW optimizer state (m/v moments) + iteration/step counters. The LR schedule resumes exactly where it left off.
 
-**File size**: ~14 MB for the current 1.2M-param config (scales with param count).
+**File size**: ~55 MB for the current 4.77M-param config (scales with param count). Uses RGPT0002 binary format.
 
 **Ctrl-C**: Pressing Ctrl-C mid-training saves both checkpoints before exiting:
 ```
@@ -96,18 +96,20 @@ If `train.txt` is absent the model falls back to a small built-in sample (good f
 | Model Size | Min | Recommended |
 |------------|-----|-------------|
 | Tiny (~80K params) | 10 KB | 50 KB |
-| Current (~1.2M params) | 100 KB | 500 KB–2 MB |
-| Medium (~4.8M params) | 500 KB | 2–10 MB |
+| Small (~1.2M params) | 100 KB | 500 KB–2 MB |
+| **Current (~4.77M params)** | 500 KB | 2–10 MB |
+| Large (~40M params) | 5 MB | 50 MB+ |
 
 ## Scaling the Model
 
-Edit constants in `src/main.rs` and rebuild. The main levers:
+Edit constants in `src/config.rs` and rebuild. The main levers:
 
 ```rust
-const N_EMBD: usize  = 128;   // Embedding dimension
-const N_HEAD: usize  = 8;     // Attention heads (must divide N_EMBD evenly)
-const N_LAYER: usize = 6;     // Transformer layers
-const BLOCK_SIZE: usize = 64; // Context window (tokens)
+pub const N_EMBD: usize     = 256;  // Embedding dimension
+pub const N_HEAD: usize     = 8;    // Attention heads (must divide N_EMBD evenly)
+pub const N_LAYER: usize    = 6;    // Transformer layers
+pub const BLOCK_SIZE: usize = 64;   // Context window (tokens)
+pub const BATCH_SIZE: usize = 128;  // Batch size
 ```
 
 ### Preset configs
@@ -115,8 +117,8 @@ const BLOCK_SIZE: usize = 64; // Context window (tokens)
 | Preset | N_EMBD | N_HEAD | N_LAYER | Params |
 |--------|--------|--------|---------|--------|
 | Tiny | 64 | 4 | 2 | ~80K |
-| **Current (default)** | **128** | **8** | **6** | **~1.2M** |
-| Medium | 256 | 8 | 6 | ~4.8M |
+| Small | 128 | 8 | 6 | ~1.2M |
+| **Current (default)** | **256** | **8** | **6** | **~4.77M** |
 | Large | 512 | 16 | 12 | ~40M |
 
 > **Checkpoint compatibility**: Changing any architecture constant invalidates existing checkpoints. Start fresh (delete `.bin` files) after changing model shape.
@@ -149,22 +151,24 @@ let sample = generate(
 
 ## Metal GPU Acceleration (Apple Silicon)
 
-On M-series Macs, Metal is used automatically for inference and loss estimation — you'll see:
+On M-series Macs, Metal is used automatically for the entire training loop — you'll see:
 
 ```
 ✓ Metal GPU enabled on device: Metal(MetalDevice(DeviceId(1)))
+Metal GPU: enabled — training via Candle autograd
 ```
 
-Training runs on CPU (Rayon). This is intentional: Metal accelerates the batched matmuls in `estimate_loss` and `generate`, which are >100× faster than CPU for the full sequence. The backward pass remains CPU-only.
+The forward pass, backward pass (Candle autograd), and weight uploads all run on GPU. AdamW optimizer moments stay on CPU (`Vec<f32>`) — gradients are pulled off GPU, clipped, updated, and re-uploaded each iteration.
 
-If Metal is unavailable (non-Apple hardware or driver issue), the code falls back to CPU transparently.
+If Metal is unavailable (non-Apple hardware or driver issue), the code falls back to CPU (Rayon + Accelerate BLAS) transparently.
 
 ## Performance Tips
 
 1. **Always use `--release`** — debug builds are 20–50× slower
 2. **Use a checkpoint interval** — the default 100-iter checkpoint means at most 100 iters lost if interrupted
 3. **Prefer `checkpoint_best.bin`** for long resumptions — it reflects the model's best state, not just the most recent
-4. **RSS memory** is stable at ~420 MB for the default config — if you see it growing, something is wrong
+4. **RSS memory** is ~2-3 GB for the default config on Metal (unified memory holds GPU activations + autograd tape)
+5. **First iteration is slower** — Metal JIT-compiles kernels on the first batch; subsequent iters are at full speed
 
 ## Troubleshooting
 

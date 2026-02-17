@@ -1,32 +1,32 @@
 # randyGPT - Mini GPT in Rust
 
-A GPT-style language model implemented from scratch in Rust. No external ML frameworks for training — pure Rust with Rayon for parallelism and Candle/Metal for accelerated inference on Apple Silicon.
+A GPT-style language model implemented from scratch in Rust. Training runs on Metal GPU via Candle autograd on Apple Silicon, with a CPU fallback (Rayon + Accelerate BLAS) on other systems.
 
 ## Features
 
-- **Transformer Architecture**: Multi-head attention, feed-forward layers, residual connections, RMSNorm
-- **Multi-Core Training**: Rayon parallelization across all CPU cores
-- **Full Training Loop**: Backward pass, AdamW optimizer, gradient clipping, dropout
+- **Transformer Architecture**: Multi-head causal attention, feed-forward layers, residual connections, RMSNorm
+- **Metal GPU Training**: Candle autograd on Apple M-series — forward + backward on GPU, AdamW on CPU
+- **CPU Fallback**: Rayon multi-core + Accelerate BLAS (sgemm batched backward) when Metal unavailable
+- **Full Training Loop**: AdamW optimizer, gradient clipping, dropout, LR warmup + cosine decay
 - **GPT-2 Style Init**: Scaled output projections for stable deep training
-- **LR Schedule**: Linear warmup → constant → cosine decay
-- **Metal GPU Inference**: Batched matmuls via Candle on Apple M-series chips (inference/eval only)
-- **Checkpoint Save/Resume**: Save and continue training across sessions
-- **Character-Level Tokenization**: With BOS/EOS tokens, up to 512-char vocabulary
+- **Checkpoint Save/Resume**: RGPT0002 format; save and continue across sessions
+- **Character-Level Tokenization**: Up to 512-char vocabulary with BOS/EOS tokens
 - **KV Cache**: Efficient autoregressive generation
 - **Top-P + Temperature Sampling**: Nucleus sampling for text generation
 
-## Current Model Configuration (v0.5)
+## Current Model Configuration (v0.8.0)
 
 | Hyperparameter | Value |
 |----------------|-------|
-| Embedding dim | 128 |
+| Embedding dim | 256 |
 | Attention heads | 8 |
 | Layers | 6 |
 | Block size | 64 tokens |
-| MLP hidden dim | 512 (4× embd) |
-| Parameters | ~1.20M |
+| MLP hidden dim | 1024 (4× embd) |
+| Parameters | ~4.77M |
 | Dropout | 0.1 |
 | Optimizer | AdamW (wd=0.01) |
+| Batch size | 128 |
 
 ## Usage
 
@@ -34,11 +34,6 @@ A GPT-style language model implemented from scratch in Rust. No external ML fram
 
 ```bash
 cargo build --release
-```
-
-Requires Rust nightly (for Candle Metal support):
-```bash
-rustup default nightly
 ```
 
 ### Train from scratch
@@ -50,28 +45,28 @@ rustup default nightly
 ### Resume training from a checkpoint
 
 ```bash
-# Resume from the last periodic checkpoint (auto path)
+# Resume from last checkpoint (auto path)
 ./target/release/randygpt --iters 2000 --resume
 
 # Resume from the best-loss checkpoint
 ./target/release/randygpt --iters 2000 --resume checkpoint_best.bin
 
-# Resume from a specific checkpoint file
+# Resume from a specific file
 ./target/release/randygpt --iters 5000 --resume my_run.bin
 ```
 
 ### Checkpoint files
 
-State is serialized to memory every iteration and flushed to disk only when training finishes or you press **Ctrl-C** — zero disk I/O in the hot loop, so CPU stays at full multi-core.
+Weights are serialized to memory every `EVAL_INTERVAL` iterations and flushed to disk when training finishes or you press **Ctrl-C** — zero disk I/O in the hot loop.
 
-| File | Flushed when |
-|------|-------------|
-| `checkpoint.bin` | Training completes or Ctrl-C |
-| `checkpoint_best.bin` | Training completes or Ctrl-C (if loss improved) |
+| File | Contents |
+|------|---------|
+| `checkpoint.bin` | Latest periodic checkpoint |
+| `checkpoint_best.bin` | Best-loss checkpoint |
 
-Both files include model weights **and** full AdamW optimizer state, so the LR schedule resumes correctly from exactly where you left off.
+Both files use the RGPT0002 format and include model weights + full AdamW optimizer state, so the LR schedule resumes correctly from exactly where you left off.
 
-Checkpoint size: ~14 MB for the current 1.2M-param config.
+Checkpoint size: ~55 MB for the current 4.77M-param config.
 
 ### Training data
 
@@ -91,61 +86,56 @@ If `train.txt` is absent, the model falls back to a tiny built-in sample.
 
 ### Forward Pass
 
-1. **Token + Position Embedding** — learned lookup tables
-2. **Transformer Layers** (×N_LAYER):
+1. **Token + Position Embedding** — learned lookup tables `[vocab, D]` and `[T, D]`
+2. **Transformer Layers** (×6):
    - RMSNorm → Multi-head causal self-attention → Residual
    - RMSNorm → MLP (squared ReLU, 4× expansion) → Residual
    - Dropout after attention projection and MLP output (training only)
 3. **LM Head** — linear projection to vocab logits
 
-### Training
+### Training (Metal GPU path)
 
-- **Loss**: Cross-entropy over all sequence positions (not just last token)
-- **Backward**: MLP and embedding gradients; attention handled via simplified path
-- **Optimizer**: AdamW — Adam with decoupled weight decay (β₁=0.9, β₂=0.999, wd=0.01)
+- **Forward + Backward**: Candle autograd on Metal — fully batched `[128, 64, 256]` tensor ops
+- **Loss**: `candle_nn::loss::cross_entropy` over all sequence positions
+- **Gradients**: `loss.backward()` → `GradStore` → pulled to CPU via `.to_vec1::<f32>()`
+- **Optimizer**: AdamW moments stay on CPU; updated weights re-uploaded via `Var::set()`
 - **Gradient clipping**: L∞ norm clipped at 1.0
-- **Parallelism**: Rayon processes each batch item on a separate thread; gradients summed after
 
-### Metal GPU Acceleration
+### Training (CPU fallback)
 
-On Apple Silicon Macs, Metal is used for batched matrix multiplications during inference and loss estimation. Training stays on CPU (the backward pass is CPU-only, and Rayon's parallelism already uses all cores effectively).
+- **Rayon**: Each batch item processed on a separate thread; gradients summed after
+- **BLAS**: Accelerate `cblas_sgemv` for d_x, `cblas_sgemm` for batched d_W (one call per weight matrix instead of T rank-1 updates)
 
-The benchmark for the current config:
-- CPU QKV [64×128]*[128×128]: ~0.6ms
-- Metal QKV: <0.01ms (>100× faster for batched ops)
+## Performance (Apple M-series, Shakespeare 1.1M tokens)
 
-## Performance
-
-- **Training speed**: ~45s per 100 iterations (Shakespeare, 1.1M tokens, 12 cores)
-- **CPU usage**: ~350% (3–4 cores effectively via Rayon at current batch/model size)
-- **Memory**: ~420 MB RSS (stable, no growth)
+| Version | ms/iter | 1000 iter | Notes |
+|---------|---------|-----------|-------|
+| v0.7.1 CPU | ~964ms | ~96s | 12 cores, batch=128, SGEMM backward |
+| **v0.8.0 GPU** | **~518ms** | **~52s** | Metal autograd, batch=128 |
 
 ## Parameter Scaling Reference
 
 | Config | Layers | Dim | Heads | Params |
 |--------|--------|-----|-------|--------|
 | Tiny | 2 | 64 | 4 | ~80K |
-| Current | 6 | 128 | 8 | ~1.2M |
-| Medium | 6 | 256 | 8 | ~4.8M |
+| Small | 6 | 128 | 8 | ~1.2M |
+| **Current** | **6** | **256** | **8** | **~4.77M** |
 | Large | 12 | 512 | 16 | ~40M |
 
-## TODO / Future Improvements
+## Completed Improvements
 
-- [x] ~~Implement backward pass for training~~ ✅ (v0.2)
-- [x] ~~Add Adam optimizer~~ ✅ (v0.2)
-- [x] ~~Multi-core training~~ ✅ Rayon (v0.3)
-- [x] ~~Gradient clipping~~ ✅ (v0.4)
-- [x] ~~Learning rate scheduling~~ ✅ (v0.4)
-- [x] ~~Dropout~~ ✅ (v0.4)
-- [x] ~~GPT-2 style initialization~~ ✅ (v0.4)
-- [x] ~~CLI arguments~~ ✅ (v0.4)
-- [x] ~~Model checkpointing (save/load weights)~~ ✅ (v0.5)
-- [x] ~~Metal/GPU inference acceleration~~ ✅ Candle (v0.5)
-- [x] ~~Full attention gradient computation~~ ✅ (v0.6.0)
-- [x] ~~Validation split and perplexity metrics~~ ✅ (v0.6.0)
-- [ ] BLAS integration for CPU matmuls
-- [ ] BPE tokenization
-- [ ] Mixed precision training
+- [x] Backward pass for training (v0.2)
+- [x] Adam optimizer (v0.2)
+- [x] Multi-core training via Rayon (v0.3)
+- [x] Gradient clipping, LR scheduling, dropout (v0.4)
+- [x] GPT-2 style initialization (v0.4)
+- [x] Model checkpointing (v0.5)
+- [x] Metal GPU inference via Candle (v0.5)
+- [x] Full attention gradient computation (v0.6)
+- [x] Validation split and perplexity metrics (v0.6)
+- [x] Accelerate BLAS for CPU matmuls (v0.7.0)
+- [x] SGEMM batched backward, 256-dim, batch=128 (v0.7.1)
+- [x] Metal GPU training via Candle autograd (v0.8.0)
 
 ## Credits
 
