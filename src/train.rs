@@ -11,7 +11,7 @@ use crate::config::*;
 use crate::forward::{forward, forward_metal_logits};
 use crate::model::{GPTModel, GradientBuffer};
 use crate::ops::{
-    clip_gradients, cross_entropy_loss, linear_bwd,
+    clip_gradients, cross_entropy_loss, linear_bwd_dx_only, linear_bwd_dw_batched,
     softmax_bwd, softmax_fwd,
 };
 use crate::optimizer::{adam_step, get_learning_rate, zero_grads};
@@ -189,53 +189,94 @@ pub fn train(
                 let (logits_seq, acts) =
                     forward(&x_vec, model_ref, &mut kv_cache, true, Some(&mut thread_rng));
 
+                let seq_len = logits_seq.len();
                 let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
                 let mut total_loss  = 0.0f32;
 
-                // Scratch buffers hoisted out of per-position loop
+                // ── Per-position d_x pass ─────────────────────────────────
+                // Compute d_x at every position (sequential — each pos depends
+                // on earlier positions via the causal mask).  Along the way,
+                // collect the activation matrices needed for the batched d_w
+                // SGEMM pass below.
+                //
+                // Flat buffers: [seq_len × dim], row-major.
+                // "d_" prefix = gradient of loss w.r.t. that activation.
+                let mut d_x_all    = vec![0.0f32; seq_len * N_EMBD];   // d_x per position
+                let mut d_logits_mat = vec![0.0f32; seq_len * model_ref.vocab_size];
+
+                // Per-layer activation matrices for batched d_w
+                // [layer][pos × dim]
+                let mut mat_x_out      = vec![0.0f32; seq_len * N_EMBD];
+                let mut mat_attn_out   = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut mat_xn_attn    = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut mat_xn_mlp     = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut mat_mlp_post   = vec![vec![0.0f32; seq_len * MLP_DIM]; N_LAYER];
+
+                // d_out matrices (filled during position loop, used in SGEMM pass)
+                let mut d_lm_head_d   = vec![0.0f32; seq_len * model_ref.vocab_size];
+                let mut d_wo_d        = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut d_wq_d        = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut d_wk_d        = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut d_wv_d        = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+                let mut d_fc1_d       = vec![vec![0.0f32; seq_len * MLP_DIM]; N_LAYER];
+                let mut d_fc2_d       = vec![vec![0.0f32; seq_len * N_EMBD]; N_LAYER];
+
+                // Populate activation matrices from saved acts
+                for pos in 0..seq_len {
+                    mat_x_out[pos * N_EMBD .. (pos+1)*N_EMBD]
+                        .copy_from_slice(&acts[pos].x_out);
+                    for li in 0..N_LAYER {
+                        mat_attn_out[li][pos*N_EMBD..(pos+1)*N_EMBD]
+                            .copy_from_slice(&acts[pos].attn_out[li]);
+                        mat_xn_attn[li][pos*N_EMBD..(pos+1)*N_EMBD]
+                            .copy_from_slice(&acts[pos].xn_attn[li]);
+                        mat_xn_mlp[li][pos*N_EMBD..(pos+1)*N_EMBD]
+                            .copy_from_slice(&acts[pos].xn_mlp[li]);
+                        mat_mlp_post[li][pos*MLP_DIM..(pos+1)*MLP_DIM]
+                            .copy_from_slice(&acts[pos].mlp_post[li]);
+                    }
+                }
+
                 let mut probs    = vec![0.0f32; model_ref.vocab_size];
-                let mut d_logits = vec![0.0f32; model_ref.vocab_size];
                 let mut d_x_out  = vec![0.0f32; N_EMBD];
 
-                for pos in 0..logits_seq.len() {
+                for pos in 0..seq_len {
                     softmax_fwd(&logits_seq[pos], model_ref.vocab_size, &mut probs, 1.0);
                     total_loss += cross_entropy_loss(&probs, y_vec[pos]);
 
-                    d_logits.copy_from_slice(&probs);
-                    d_logits[y_vec[pos]] -= 1.0;
+                    // d_logits = probs - one_hot(target)
+                    let dl = &mut d_logits_mat[pos * model_ref.vocab_size
+                                              .. (pos+1) * model_ref.vocab_size];
+                    dl.copy_from_slice(&probs);
+                    dl[y_vec[pos]] -= 1.0;
 
+                    // d_x_out via lm_head (d_w accumulated via SGEMM later)
                     d_x_out.fill(0.0);
-                    linear_bwd(
-                        &d_logits,
-                        &acts[pos].x_out,
-                        &model_ref.lm_head,
-                        model_ref.vocab_size,
-                        N_EMBD,
-                        &mut d_x_out,
-                        &mut local_grads.d_lm_head,
-                    );
+                    {
+                        let dl_slice = &d_logits_mat[pos * model_ref.vocab_size
+                                                    .. (pos+1) * model_ref.vocab_size];
+                        // d_x_out = lm_head^T · d_logits  (sgemv, no d_w here)
+                        linear_bwd_dx_only(
+                            dl_slice, &model_ref.lm_head,
+                            model_ref.vocab_size, N_EMBD, &mut d_x_out,
+                        );
+                        // store d_logits for SGEMM pass
+                        d_lm_head_d[pos * model_ref.vocab_size
+                                    .. (pos+1) * model_ref.vocab_size]
+                            .copy_from_slice(dl_slice);
+                    }
 
                     let mut d_x = d_x_out.clone();
 
                     for li in (0..N_LAYER).rev() {
-                        let fc2_w = model_ref.layers[li].fc2.clone();
-                        let fc1_w = model_ref.layers[li].fc1.clone();
-                        let wo_w  = model_ref.layers[li].wo.clone();
-                        let wq_w  = model_ref.layers[li].wq.clone();
-                        let wk_w  = model_ref.layers[li].wk.clone();
-                        let wv_w  = model_ref.layers[li].wv.clone();
-
-                        // ----- MLP backward -----
+                        // ----- MLP backward (d_x only) -----
                         let mut d_h2 = vec![0.0f32; MLP_DIM];
-                        linear_bwd(
-                            &d_x,
-                            &acts[pos].mlp_post[li],
-                            &fc2_w,
-                            N_EMBD,
-                            MLP_DIM,
-                            &mut d_h2,
-                            &mut local_grads.d_fc2[li * N_EMBD * MLP_DIM .. (li + 1) * N_EMBD * MLP_DIM],
+                        linear_bwd_dx_only(
+                            &d_x, &model_ref.layers[li].fc2,
+                            N_EMBD, MLP_DIM, &mut d_h2,
                         );
+                        // store d_fc2_d for SGEMM
+                        d_fc2_d[li][pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_x);
 
                         let mut d_h1 = vec![0.0f32; MLP_DIM];
                         for i in 0..MLP_DIM {
@@ -243,32 +284,26 @@ pub fn train(
                                 d_h1[i] = d_h2[i] * 2.0 * acts[pos].mlp_pre[li][i];
                             }
                         }
+                        // store d_fc1_d for SGEMM
+                        d_fc1_d[li][pos*MLP_DIM..(pos+1)*MLP_DIM].copy_from_slice(&d_h1);
 
                         let mut d_xn_mlp = vec![0.0f32; N_EMBD];
-                        linear_bwd(
-                            &d_h1,
-                            &acts[pos].xn_mlp[li],
-                            &fc1_w,
-                            MLP_DIM,
-                            N_EMBD,
-                            &mut d_xn_mlp,
-                            &mut local_grads.d_fc1[li * MLP_DIM * N_EMBD .. (li + 1) * MLP_DIM * N_EMBD],
+                        linear_bwd_dx_only(
+                            &d_h1, &model_ref.layers[li].fc1,
+                            MLP_DIM, N_EMBD, &mut d_xn_mlp,
                         );
 
                         let mut d_x_mid = vec![0.0f32; N_EMBD];
                         for i in 0..N_EMBD { d_x_mid[i] = d_xn_mlp[i] + d_x[i]; }
 
-                        // ----- Attention backward -----
+                        // ----- Attention backward (d_x only) -----
                         let mut d_attn_out = vec![0.0f32; N_EMBD];
-                        linear_bwd(
-                            &d_x_mid,
-                            &acts[pos].attn_out[li],
-                            &wo_w,
-                            N_EMBD,
-                            N_EMBD,
-                            &mut d_attn_out,
-                            &mut local_grads.d_wo[li * N_EMBD * N_EMBD .. (li + 1) * N_EMBD * N_EMBD],
+                        linear_bwd_dx_only(
+                            &d_x_mid, &model_ref.layers[li].wo,
+                            N_EMBD, N_EMBD, &mut d_attn_out,
                         );
+                        // store d_wo_d for SGEMM
+                        d_wo_d[li][pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_x_mid);
 
                         let mut d_q = vec![0.0f32; N_EMBD];
                         let mut d_k = vec![0.0f32; N_EMBD];
@@ -277,64 +312,53 @@ pub fn train(
 
                         for h in 0..N_HEAD {
                             let hs = h * HEAD_DIM;
-
-                            // Recompute attention weights
                             let mut scores = vec![0.0f32; pos + 1];
                             for t in 0..=pos {
                                 let dot: f32 = (0..HEAD_DIM)
-                                    .map(|j| acts[pos].q[li][hs + j] * kv_cache[li][t].0[hs + j])
+                                    .map(|j| acts[pos].q[li][hs+j] * kv_cache[li][t].0[hs+j])
                                     .sum();
                                 scores[t] = dot * scale;
                             }
                             let mut attn_weights = vec![0.0f32; pos + 1];
                             softmax_fwd(&scores, pos + 1, &mut attn_weights, 1.0);
 
-                            // d_attn_weights and d_v for current position
                             let mut d_attn_weights = vec![0.0f32; pos + 1];
                             for t in 0..=pos {
                                 for j in 0..HEAD_DIM {
                                     d_attn_weights[t] +=
-                                        d_attn_out[hs + j] * kv_cache[li][t].1[hs + j];
+                                        d_attn_out[hs+j] * kv_cache[li][t].1[hs+j];
                                     if t == pos {
-                                        d_v[hs + j] += attn_weights[t] * d_attn_out[hs + j];
+                                        d_v[hs+j] += attn_weights[t] * d_attn_out[hs+j];
                                     }
                                 }
                             }
-
-                            // Softmax backward → d_scores
                             let mut d_scores = vec![0.0f32; pos + 1];
-                            softmax_bwd(&attn_weights, &d_attn_weights, pos + 1, &mut d_scores);
-
-                            // d_q and d_k for current position
+                            softmax_bwd(&attn_weights, &d_attn_weights, pos+1, &mut d_scores);
                             for t in 0..=pos {
                                 for j in 0..HEAD_DIM {
-                                    d_q[hs + j] +=
-                                        d_scores[t] * scale * kv_cache[li][t].0[hs + j];
+                                    d_q[hs+j] += d_scores[t] * scale * kv_cache[li][t].0[hs+j];
                                     if t == pos {
-                                        d_k[hs + j] +=
-                                            d_scores[t] * scale * acts[pos].q[li][hs + j];
+                                        d_k[hs+j] += d_scores[t] * scale * acts[pos].q[li][hs+j];
                                     }
                                 }
                             }
                         }
 
-                        // Backward through Q, K, V projections
+                        // d_x through Q/K/V projections (d_w via SGEMM later)
                         let mut d_xn_q = vec![0.0f32; N_EMBD];
                         let mut d_xn_k = vec![0.0f32; N_EMBD];
                         let mut d_xn_v = vec![0.0f32; N_EMBD];
-                        let sq = N_EMBD * N_EMBD;
+                        linear_bwd_dx_only(&d_q, &model_ref.layers[li].wq,
+                            N_EMBD, N_EMBD, &mut d_xn_q);
+                        linear_bwd_dx_only(&d_k, &model_ref.layers[li].wk,
+                            N_EMBD, N_EMBD, &mut d_xn_k);
+                        linear_bwd_dx_only(&d_v, &model_ref.layers[li].wv,
+                            N_EMBD, N_EMBD, &mut d_xn_v);
+                        // store d_q/k/v for SGEMM
+                        d_wq_d[li][pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_q);
+                        d_wk_d[li][pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_k);
+                        d_wv_d[li][pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_v);
 
-                        linear_bwd(&d_q, &acts[pos].xn_attn[li], &wq_w,
-                            N_EMBD, N_EMBD, &mut d_xn_q,
-                            &mut local_grads.d_wq[li * sq .. (li + 1) * sq]);
-                        linear_bwd(&d_k, &acts[pos].xn_attn[li], &wk_w,
-                            N_EMBD, N_EMBD, &mut d_xn_k,
-                            &mut local_grads.d_wk[li * sq .. (li + 1) * sq]);
-                        linear_bwd(&d_v, &acts[pos].xn_attn[li], &wv_w,
-                            N_EMBD, N_EMBD, &mut d_xn_v,
-                            &mut local_grads.d_wv[li * sq .. (li + 1) * sq]);
-
-                        // Combined attention input gradient + residual
                         for i in 0..N_EMBD {
                             d_x[i] = d_xn_q[i] + d_xn_k[i] + d_xn_v[i] + d_x_mid[i];
                         }
@@ -345,9 +369,63 @@ pub fn train(
                         local_grads.d_wte[x_vec[pos] * N_EMBD + i] += d_x[i];
                         local_grads.d_wpe[pos * N_EMBD + i]          += d_x[i];
                     }
+                    d_x_all[pos*N_EMBD..(pos+1)*N_EMBD].copy_from_slice(&d_x);
                 }
 
-                (local_grads, total_loss / logits_seq.len() as f32)
+                // ── Batched d_w pass via SGEMM ────────────────────────────
+                // Each weight gradient = D^T · X  (one sgemm per matrix).
+                // At seq_len=64 this replaces 64 sger calls with 1 sgemm,
+                // letting AMX/SIMD process the full sequence in parallel.
+
+                // lm_head: d_w += d_logits^T · x_out
+                linear_bwd_dw_batched(
+                    &d_lm_head_d, &mat_x_out,
+                    seq_len, model_ref.vocab_size, N_EMBD,
+                    &mut local_grads.d_lm_head,
+                );
+
+                for li in 0..N_LAYER {
+                    let sq   = N_EMBD * N_EMBD;
+                    let fc1s = MLP_DIM * N_EMBD;
+                    let fc2s = N_EMBD * MLP_DIM;
+
+                    // wo: d_w += d_wo_d^T · attn_out
+                    linear_bwd_dw_batched(
+                        &d_wo_d[li], &mat_attn_out[li],
+                        seq_len, N_EMBD, N_EMBD,
+                        &mut local_grads.d_wo[li*sq..(li+1)*sq],
+                    );
+                    // wq, wk, wv: d_w += d_q/k/v^T · xn_attn
+                    linear_bwd_dw_batched(
+                        &d_wq_d[li], &mat_xn_attn[li],
+                        seq_len, N_EMBD, N_EMBD,
+                        &mut local_grads.d_wq[li*sq..(li+1)*sq],
+                    );
+                    linear_bwd_dw_batched(
+                        &d_wk_d[li], &mat_xn_attn[li],
+                        seq_len, N_EMBD, N_EMBD,
+                        &mut local_grads.d_wk[li*sq..(li+1)*sq],
+                    );
+                    linear_bwd_dw_batched(
+                        &d_wv_d[li], &mat_xn_attn[li],
+                        seq_len, N_EMBD, N_EMBD,
+                        &mut local_grads.d_wv[li*sq..(li+1)*sq],
+                    );
+                    // fc1: d_w += d_fc1_d^T · xn_mlp
+                    linear_bwd_dw_batched(
+                        &d_fc1_d[li], &mat_xn_mlp[li],
+                        seq_len, MLP_DIM, N_EMBD,
+                        &mut local_grads.d_fc1[li*fc1s..(li+1)*fc1s],
+                    );
+                    // fc2: d_w += d_fc2_d^T · mlp_post
+                    linear_bwd_dw_batched(
+                        &d_fc2_d[li], &mat_mlp_post[li],
+                        seq_len, N_EMBD, MLP_DIM,
+                        &mut local_grads.d_fc2[li*fc2s..(li+1)*fc2s],
+                    );
+                }
+
+                (local_grads, total_loss / seq_len as f32)
             })
             .collect();
 

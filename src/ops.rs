@@ -38,6 +38,18 @@ mod blas {
             y: *const c_float, incy: c_int,
             a: *mut c_float, lda: c_int,
         );
+
+        // C = alpha * A * B + beta * C   (matrix-matrix multiply)
+        #[allow(dead_code)]
+        pub fn cblas_sgemm(
+            order: c_int, transa: c_int, transb: c_int,
+            m: c_int, n: c_int, k: c_int,
+            alpha: c_float,
+            a: *const c_float, lda: c_int,
+            b: *const c_float, ldb: c_int,
+            beta: c_float,
+            c: *mut c_float, ldc: c_int,
+        );
     }
 }
 
@@ -88,6 +100,59 @@ pub fn linear_bwd(
             1.0,
             d_out.as_ptr(), 1,
             x.as_ptr(), 1,
+            d_w.as_mut_ptr(), nin as i32,
+        );
+    }
+}
+
+// d_x only (no d_w): d_x = W^T · d_out  via sgemv.
+// Used in the sequential d_x pass when d_w will be computed later via SGEMM.
+pub fn linear_bwd_dx_only(
+    d_out: &[f32],
+    w: &[f32],
+    nout: usize,
+    nin: usize,
+    d_x: &mut [f32],
+) {
+    unsafe {
+        blas::cblas_sgemv(
+            blas::ROW_MAJOR, blas::TRANS,
+            nout as i32, nin as i32,
+            1.0,
+            w.as_ptr(), nin as i32,
+            d_out.as_ptr(), 1,
+            0.0,
+            d_x.as_mut_ptr(), 1,
+        );
+    }
+}
+
+// Batched linear backward for weight gradient only:
+//   d_w[nout×nin] += D^T · X   where D is [T×nout] and X is [T×nin]
+//
+// This replaces T calls to cblas_sger with a single cblas_sgemm,
+// enabling AMX/SIMD to process the full sequence in one kernel launch.
+// The d_x computation is NOT included here — call linear_bwd per-position
+// for d_x as before (it's cheap: just a sgemv).
+pub fn linear_bwd_dw_batched(
+    d_out: &[f32],   // [T × nout] row-major
+    x: &[f32],       // [T × nin]  row-major
+    t: usize,        // sequence length T
+    nout: usize,
+    nin: usize,
+    d_w: &mut [f32], // [nout × nin] accumulated in-place
+) {
+    // d_w += D^T · X  →  cblas_sgemm(C=d_w, A=D^T, B=X)
+    // In cblas row-major terms: C[nout×nin] = D^T[nout×T] · X[T×nin]
+    // = sgemm(RowMajor, Trans, NoTrans, nout, nin, T, 1, D, nout, X, nin, 1, d_w, nin)
+    unsafe {
+        blas::cblas_sgemm(
+            blas::ROW_MAJOR, blas::TRANS, blas::NO_TRANS,
+            nout as i32, nin as i32, t as i32,
+            1.0,
+            d_out.as_ptr(), nout as i32,   // lda = nout (leading dim of D before transpose)
+            x.as_ptr(),    nin as i32,     // ldb = nin
+            1.0,                            // beta=1: accumulate into d_w
             d_w.as_mut_ptr(), nin as i32,
         );
     }
