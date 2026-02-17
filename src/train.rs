@@ -426,21 +426,23 @@ pub fn train(
         // Log + snapshot checkpoint buffers
         let is_log_iter = iter % EVAL_INTERVAL == 0 || iter == iterations - 1;
         if is_log_iter {
-            let elapsed   = train_start.elapsed().as_secs_f32();
-            let avg_ms    = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
-            let elapsed_s = format!("{:.0}s", elapsed);
+            let elapsed = train_start.elapsed().as_secs_f32();
+            let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+            let remaining_iters = iterations.saturating_sub(iter + 1);
+            let eta_s   = avg_ms * remaining_iters as f32 / 1000.0;
+            let timing  = format!("{:.0}ms/iter | {:.0}s elapsed | ETA {:.0}s", avg_ms, elapsed, eta_s);
 
             if !val_data.is_empty() {
                 let val_loss = estimate_loss(model, val_data, 10, rng);
                 let val_ppl  = val_loss.exp();
                 println!(
-                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {:.0}ms/iter | {}",
-                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, avg_ms, elapsed_s
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing
                 );
             } else {
                 println!(
-                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{} | {:.0}ms/iter | {}",
-                    iter, batch_loss, lr, best_loss, best_iter, avg_ms, elapsed_s
+                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{} | {}",
+                    iter, batch_loss, lr, best_loss, best_iter, timing
                 );
             }
             ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);

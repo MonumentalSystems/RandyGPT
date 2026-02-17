@@ -12,7 +12,7 @@ pub const MLP_DIM: usize = 4 * N_EMBD;
 pub const MAX_VOCAB: usize = 512;
 
 // Training
-pub const BATCH_SIZE: usize = 32;
+pub const BATCH_SIZE: usize = 128;
 pub const LEARNING_RATE: f32 = 3e-5;
 pub const MIN_LEARNING_RATE: f32 = 3e-6;
 pub const WEIGHT_DECAY: f32 = 0.01;
