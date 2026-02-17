@@ -18,6 +18,7 @@
 use std::fs::File;
 use std::io::{Read, Write};
 use crate::config::*;
+use crate::model::CandleModel;
 use crate::model::GPTModel;
 
 // ── In-memory helpers ──────────────────────────────────────────────
@@ -149,6 +150,134 @@ pub fn load_checkpoint(
     model.v_wpe     = read_f32_slice(&mut f, model.wpe.len())?;
     model.m_lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
     model.v_lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].m_wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].v_fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].m_fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+        model.layers[li].v_fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+    }
+
+    Ok((iter + 1, step, best_loss))
+}
+
+// ── RGPT0002: CandleModel checkpoint (same binary layout, new magic) ──
+
+/// Serialize a CandleModel to in-memory bytes (RGPT0002 format).
+/// Pulls weights from Metal tensors via to_vec1().
+pub fn serialize_checkpoint_v2(
+    model: &CandleModel,
+    iter: usize,
+    step: usize,
+    best_loss: f32,
+) -> Vec<u8> {
+    let pull = |v: &candle_core::Var| -> Vec<f32> {
+        v.as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"RGPT0002");
+    buf.extend_from_slice(&(model.vocab_size as u32).to_le_bytes());
+    buf.extend_from_slice(&(iter as u32).to_le_bytes());
+    buf.extend_from_slice(&(step as u32).to_le_bytes());
+    buf.extend_from_slice(&best_loss.to_le_bytes());
+
+    write_f32s(&mut buf, &pull(&model.wte));
+    write_f32s(&mut buf, &pull(&model.wpe));
+    write_f32s(&mut buf, &pull(&model.lm_head));
+    for li in 0..N_LAYER {
+        let l = &model.layers[li];
+        write_f32s(&mut buf, &pull(&l.wq));
+        write_f32s(&mut buf, &pull(&l.wk));
+        write_f32s(&mut buf, &pull(&l.wv));
+        write_f32s(&mut buf, &pull(&l.wo));
+        write_f32s(&mut buf, &pull(&l.fc1));
+        write_f32s(&mut buf, &pull(&l.fc2));
+    }
+
+    write_f32s(&mut buf, &model.m_wte);    write_f32s(&mut buf, &model.v_wte);
+    write_f32s(&mut buf, &model.m_wpe);    write_f32s(&mut buf, &model.v_wpe);
+    write_f32s(&mut buf, &model.m_lm_head); write_f32s(&mut buf, &model.v_lm_head);
+    for li in 0..N_LAYER {
+        let l = &model.layers[li];
+        write_f32s(&mut buf, &l.m_wq); write_f32s(&mut buf, &l.v_wq);
+        write_f32s(&mut buf, &l.m_wk); write_f32s(&mut buf, &l.v_wk);
+        write_f32s(&mut buf, &l.m_wv); write_f32s(&mut buf, &l.v_wv);
+        write_f32s(&mut buf, &l.m_wo); write_f32s(&mut buf, &l.v_wo);
+        write_f32s(&mut buf, &l.m_fc1); write_f32s(&mut buf, &l.v_fc1);
+        write_f32s(&mut buf, &l.m_fc2); write_f32s(&mut buf, &l.v_fc2);
+    }
+    buf
+}
+
+/// Load an RGPT0002 checkpoint into a CandleModel.
+pub fn load_checkpoint_v2(
+    path: &str,
+    model: &mut CandleModel,
+) -> std::io::Result<(usize, usize, f32)> {
+    use candle_core::{Tensor, Var};
+
+    let mut f = File::open(path)?;
+
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != b"RGPT0002" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Expected RGPT0002 magic in '{}', got {:?}", path, magic),
+        ));
+    }
+
+    let mut u32buf = [0u8; 4];
+    f.read_exact(&mut u32buf)?; let ckpt_vocab = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let iter       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let step       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let best_loss  = f32::from_le_bytes(u32buf);
+
+    if ckpt_vocab != model.vocab_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
+        ));
+    }
+
+    let device = &model.device.clone();
+    let upload = |f: &mut File, n: usize, shape: (usize, usize)| -> std::io::Result<Var> {
+        let data = read_f32_slice(f, n)?;
+        Var::from_tensor(
+            &Tensor::from_slice(&data, shape, device)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    };
+
+    model.wte     = upload(&mut f, model.vocab_size * N_EMBD, (model.vocab_size, N_EMBD))?;
+    model.wpe     = upload(&mut f, BLOCK_SIZE * N_EMBD,       (BLOCK_SIZE, N_EMBD))?;
+    model.lm_head = upload(&mut f, model.vocab_size * N_EMBD, (model.vocab_size, N_EMBD))?;
+
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].wq  = upload(&mut f, n_sq,             (N_EMBD, N_EMBD))?;
+        model.layers[li].wk  = upload(&mut f, n_sq,             (N_EMBD, N_EMBD))?;
+        model.layers[li].wv  = upload(&mut f, n_sq,             (N_EMBD, N_EMBD))?;
+        model.layers[li].wo  = upload(&mut f, n_sq,             (N_EMBD, N_EMBD))?;
+        model.layers[li].fc1 = upload(&mut f, MLP_DIM * N_EMBD, (MLP_DIM, N_EMBD))?;
+        model.layers[li].fc2 = upload(&mut f, N_EMBD * MLP_DIM, (N_EMBD, MLP_DIM))?;
+    }
+
+    model.m_wte     = read_f32_slice(&mut f, model.vocab_size * N_EMBD)?;
+    model.v_wte     = read_f32_slice(&mut f, model.vocab_size * N_EMBD)?;
+    model.m_wpe     = read_f32_slice(&mut f, BLOCK_SIZE * N_EMBD)?;
+    model.v_wpe     = read_f32_slice(&mut f, BLOCK_SIZE * N_EMBD)?;
+    model.m_lm_head = read_f32_slice(&mut f, model.vocab_size * N_EMBD)?;
+    model.v_lm_head = read_f32_slice(&mut f, model.vocab_size * N_EMBD)?;
     for li in 0..N_LAYER {
         let n_sq = N_EMBD * N_EMBD;
         model.layers[li].m_wq  = read_f32_slice(&mut f, n_sq)?;

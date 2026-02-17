@@ -4,31 +4,60 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 |
-|---------|------|------|------|------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay |
-| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 |
-| **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA |
-| **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules |
-| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB |
-| **Speed (1000 iter)** | N/A | ~600s† | ~78s | ~450s | ~450s | ~450s | ~215s | ~177s‡ |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay |
+| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ **training** |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 |
+| **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
+| **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules |
+| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~2-3GB |
+| **Speed (1000 iter)** | N/A | ~600s† | ~78s | ~450s | ~450s | ~450s | ~215s | ~177s‡ | ~52s§ |
 
 †Estimated
 ‡SGEMM batched backward (2.2× vs 256-dim baseline of ~390s); batch=128
+§Candle Metal autograd (~518ms/iter steady-state, ~3.4× vs v0.7.1); batch=128
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+
+---
+
+## [0.8.0] - 2026-02-16
+
+### Candle Autograd Metal Training (Strategy A Hybrid)
+
+#### GPU Training via Candle Autograd (~3.4× speedup)
+- **Forward and backward passes now run on Metal GPU** via Candle autograd
+- New `CandleModel` / `CandleLayer` structs: all weights stored as `candle_core::Var` on Metal device
+- New `forward_candle_train()`: fully batched `[BATCH_SIZE, BLOCK_SIZE, N_EMBD]` forward pass using Candle tensor ops
+  - Embeddings via `index_select` + positional encoding via `narrow`
+  - RMSNorm, multi-head causal attention, squared-ReLU MLP — all Candle ops
+  - Cross-entropy via `candle_nn::loss::cross_entropy`
+- `loss.backward()` → `GradStore` replaces hand-written two-pass SGEMM backward
+- **Optimizer stays on CPU (Strategy A)**: AdamW moments remain `Vec<f32>`, `adam_step()` reused unchanged
+- Gradients pulled off GPU via `.flatten_all().to_vec1::<f32>()`, clipped, Adam-updated, re-uploaded via `Var::set()`
+- **Measured speedup**: ~518ms/iter steady-state vs ~1774ms/iter (v0.7.1) = **~3.4×**
+
+#### RGPT0002 Checkpoint Format
+- New magic bytes `b"RGPT0002"` — incompatible with prior RGPT0001 checkpoints
+- Same binary layout (f32 arrays in same order); weights extracted from Vars via `.flatten_all().to_vec1::<f32>()`
+- `serialize_checkpoint_v2()` / `load_checkpoint_v2()` in `checkpoint.rs`
+- Resume path tries RGPT0002 first, falls back to RGPT0001 (CPU path)
+
+#### CPU Fallback Preserved
+- On systems without Metal, falls back to existing `train()` (BLAS SGEMM backward, unchanged)
+- All inference paths (`estimate_loss`, `generate`) unchanged
 
 ---
 

@@ -6,10 +6,11 @@ use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Instant;
 use rayon::prelude::*;
 
-use crate::checkpoint::{flush_checkpoint, serialize_checkpoint};
+use candle_core::Tensor;
+use crate::checkpoint::{flush_checkpoint, serialize_checkpoint, serialize_checkpoint_v2};
 use crate::config::*;
-use crate::forward::{forward, forward_metal_logits};
-use crate::model::{GPTModel, GradientBuffer};
+use crate::forward::{forward, forward_candle_train, forward_metal_logits};
+use crate::model::{CandleModel, GPTModel, GradientBuffer};
 use crate::ops::{
     clip_gradients, cross_entropy_loss, linear_bwd_dx_only, linear_bwd_dw_batched,
     softmax_bwd, softmax_fwd,
@@ -553,6 +554,180 @@ pub fn train(
 
     println!();
     println!("Training complete!");
+    println!("Total time:  {:.1}s | Avg: {:.0}ms/iter ({} iters)", total_elapsed, avg_ms, iter_count);
+    println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
+
+    if !ckpt_buf.is_empty() {
+        flush_checkpoint("checkpoint.bin", &ckpt_buf)
+            .unwrap_or_else(|e| eprintln!("Warning: could not save checkpoint: {}", e));
+    }
+    if !ckpt_best_buf.is_empty() {
+        flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+            .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Candle (Metal GPU) training loop                                   */
+/* ------------------------------------------------------------------ */
+pub fn train_candle(
+    model: &mut CandleModel,
+    data: &[usize],
+    val_data: &[usize],
+    iterations: usize,
+    rng: &mut Rng,
+    iter_start: usize,
+    step_start: usize,
+    best_loss_start: f32,
+    ctrlc_flag: Arc<AtomicBool>,
+) {
+    println!("=== Starting Training (Metal GPU via Candle) ===");
+    if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
+    println!("Iterations: {} → {}", iter_start, iterations);
+    println!("Batch size: {}", BATCH_SIZE);
+    println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
+    println!();
+
+    let device = model.device.clone();
+    let mut step       = step_start;
+    let mut best_loss  = best_loss_start;
+    let mut best_iter  = if iter_start > 0 { iter_start.saturating_sub(1) } else { 0 };
+
+    let mut ckpt_buf:      Vec<u8> = Vec::new();
+    let mut ckpt_best_buf: Vec<u8> = Vec::new();
+
+    let train_start    = Instant::now();
+    let mut iter_count = 0u64;
+    let mut total_iter_ms = 0u64;
+
+    for iter in iter_start..iterations {
+        let iter_start_time = Instant::now();
+
+        // ── Sample batch ──────────────────────────────────────────────
+        let mut tok_data:  Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
+        let mut tgt_data:  Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
+        for _ in 0..BATCH_SIZE {
+            if data.len() <= BLOCK_SIZE + 1 { continue; }
+            let start = rng.choice(data.len() - BLOCK_SIZE - 1);
+            for t in 0..BLOCK_SIZE {
+                tok_data.push(data[start + t] as u32);
+                tgt_data.push(data[start + t + 1] as u32);
+            }
+        }
+        let actual_batch = tok_data.len() / BLOCK_SIZE;
+        if actual_batch == 0 { continue; }
+
+        let tokens  = Tensor::from_vec(tok_data, (actual_batch, BLOCK_SIZE), &device)
+            .unwrap_or_else(|e| panic!("token tensor: {}", e));
+        let targets = Tensor::from_vec(tgt_data, (actual_batch, BLOCK_SIZE), &device)
+            .unwrap_or_else(|e| panic!("target tensor: {}", e));
+
+        // ── Forward + backward ────────────────────────────────────────
+        let loss_tensor = forward_candle_train(&tokens, &targets, model, true)
+            .unwrap_or_else(|e| panic!("forward: {}", e));
+        let batch_loss: f32 = loss_tensor.to_scalar::<f32>()
+            .unwrap_or_else(|e| panic!("loss scalar: {}", e));
+
+        // backward() returns GradStore; grads.get(&var) retrieves each gradient
+        let grads = loss_tensor.backward()
+            .unwrap_or_else(|e| panic!("backward: {}", e));
+
+        step += 1;
+        let lr = get_learning_rate(iter, iterations);
+
+        // ── AdamW update: pull grad, clip, adam_step on CPU, set Var ─
+        // var.set(&new_tensor) updates in-place without re-allocating the Var.
+        macro_rules! update_var {
+            ($var:expr, $m:expr, $v:expr, $shape:expr) => {{
+                if let Some(grad_t) = grads.get(&$var) {
+                    let mut g: Vec<f32> = grad_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    clip_gradients(&mut g, GRAD_CLIP);
+                    let mut w: Vec<f32> = $var.as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap();
+                    adam_step(&mut w, &g, &mut $m, &mut $v, step, lr);
+                    let new_t = Tensor::from_slice(&w, $shape, &device).unwrap();
+                    $var.set(&new_t).unwrap();
+                }
+            }};
+        }
+
+        // Embeddings + LM head
+        update_var!(model.wte,     model.m_wte,     model.v_wte,     (model.vocab_size, N_EMBD));
+        update_var!(model.wpe,     model.m_wpe,     model.v_wpe,     (BLOCK_SIZE, N_EMBD));
+        update_var!(model.lm_head, model.m_lm_head, model.v_lm_head, (model.vocab_size, N_EMBD));
+
+        // Per-layer weights
+        for li in 0..N_LAYER {
+            let l = &mut model.layers[li];
+            update_var!(l.wq,  l.m_wq,  l.v_wq,  (N_EMBD, N_EMBD));
+            update_var!(l.wk,  l.m_wk,  l.v_wk,  (N_EMBD, N_EMBD));
+            update_var!(l.wv,  l.m_wv,  l.v_wv,  (N_EMBD, N_EMBD));
+            update_var!(l.wo,  l.m_wo,  l.v_wo,  (N_EMBD, N_EMBD));
+            update_var!(l.fc1, l.m_fc1, l.v_fc1, (MLP_DIM, N_EMBD));
+            update_var!(l.fc2, l.m_fc2, l.v_fc2, (N_EMBD, MLP_DIM));
+        }
+
+        if batch_loss < best_loss {
+            best_loss = batch_loss;
+            best_iter = iter;
+        }
+
+        iter_count    += 1;
+        total_iter_ms += iter_start_time.elapsed().as_millis() as u64;
+
+        // ── Log + checkpoint ──────────────────────────────────────────
+        let is_log_iter = iter % EVAL_INTERVAL == 0 || iter == iterations - 1;
+        if is_log_iter {
+            let elapsed = train_start.elapsed().as_secs_f32();
+            let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+            let remaining_iters = iterations.saturating_sub(iter + 1);
+            let eta_s = avg_ms * remaining_iters as f32 / 1000.0;
+            let timing = format!("{:.0}ms/iter | {:.0}s elapsed | ETA {:.0}s", avg_ms, elapsed, eta_s);
+
+            if !val_data.is_empty() {
+                // Use CPU model for val loss (forward_metal_logits path unchanged)
+                let cpu_model = model.to_gpt().unwrap_or_else(|e| panic!("to_gpt: {}", e));
+                let val_loss = estimate_loss(&cpu_model, val_data, 10, rng);
+                let val_ppl  = val_loss.exp();
+                println!(
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing
+                );
+            } else {
+                println!(
+                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{} | {}",
+                    iter, batch_loss, lr, best_loss, best_iter, timing
+                );
+            }
+
+            ckpt_buf = serialize_checkpoint_v2(model, iter, step, best_loss);
+            if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
+        }
+
+        // ── Ctrl-C ────────────────────────────────────────────────────
+        if ctrlc_flag.load(Ordering::Relaxed) {
+            ckpt_buf = serialize_checkpoint_v2(model, iter, step, best_loss);
+            if best_iter == iter || ckpt_best_buf.is_empty() {
+                ckpt_best_buf = ckpt_buf.clone();
+            }
+            let elapsed = train_start.elapsed().as_secs_f32();
+            let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+            println!();
+            println!("Interrupted at iteration {}. Saving checkpoint...", iter);
+            println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
+            flush_checkpoint("checkpoint.bin", &ckpt_buf)
+                .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+            flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                .unwrap_or_else(|e| eprintln!("Warning: {}", e));
+            std::process::exit(0);
+        }
+    }
+
+    let total_elapsed = train_start.elapsed().as_secs_f32();
+    let avg_ms = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+    println!();
+    println!("Training complete! (Metal GPU)");
     println!("Total time:  {:.1}s | Avg: {:.0}ms/iter ({} iters)", total_elapsed, avg_ms, iter_count);
     println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
 

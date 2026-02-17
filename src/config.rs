@@ -26,3 +26,5 @@ pub const GRAD_CLIP: f32 = 1.0;
 
 // Metal
 pub const USE_METAL: bool = true;
+#[allow(dead_code)]
+pub const CANDLE_TRAIN: bool = true; // use Candle autograd for training when Metal available

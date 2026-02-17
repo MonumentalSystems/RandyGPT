@@ -2,6 +2,7 @@
 /* Model structs: weights, activations, gradient buffer              */
 /* ------------------------------------------------------------------ */
 
+use candle_core::{Device, Result as CResult, Tensor, Var};
 use crate::config::*;
 use crate::rng::Rng;
 
@@ -181,13 +182,131 @@ impl GradientBuffer {
         }
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn layer<'a>(field: &'a [f32], li: usize, stride: usize) -> &'a [f32] {
         &field[li * stride .. (li + 1) * stride]
     }
 
+    #[allow(dead_code)]
     #[inline(always)]
     pub fn layer_mut<'a>(field: &'a mut Vec<f32>, li: usize, stride: usize) -> &'a mut [f32] {
         &mut field[li * stride .. (li + 1) * stride]
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* Candle (Metal GPU) model: weights as Var, moments as Vec<f32>     */
+/* ------------------------------------------------------------------ */
+
+fn make_var(data: &[f32], shape: (usize, usize), device: &Device) -> CResult<Var> {
+    Var::from_tensor(&Tensor::from_slice(data, shape, device)?)
+}
+
+fn var_to_vec(v: &Var) -> CResult<Vec<f32>> {
+    v.as_tensor().flatten_all()?.to_vec1::<f32>()
+}
+
+pub struct CandleLayer {
+    pub wq: Var, pub wk: Var, pub wv: Var, pub wo: Var,
+    pub fc1: Var, pub fc2: Var,
+    // AdamW moments stay on CPU
+    pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
+    pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
+    pub m_wv: Vec<f32>, pub v_wv: Vec<f32>,
+    pub m_wo: Vec<f32>, pub v_wo: Vec<f32>,
+    pub m_fc1: Vec<f32>, pub v_fc1: Vec<f32>,
+    pub m_fc2: Vec<f32>, pub v_fc2: Vec<f32>,
+}
+
+pub struct CandleModel {
+    pub wte:     Var,  // [vocab_size, N_EMBD]
+    pub wpe:     Var,  // [BLOCK_SIZE, N_EMBD]
+    pub lm_head: Var,  // [vocab_size, N_EMBD]
+    pub layers:  Vec<CandleLayer>,
+    pub m_wte: Vec<f32>, pub v_wte: Vec<f32>,
+    pub m_wpe: Vec<f32>, pub v_wpe: Vec<f32>,
+    pub m_lm_head: Vec<f32>, pub v_lm_head: Vec<f32>,
+    pub vocab_size: usize,
+    pub device: Device,
+}
+
+impl CandleModel {
+    /// Upload CPU GPTModel weights to Metal Vars. Moments start at zero.
+    pub fn from_gpt(m: &GPTModel, device: &Device) -> CResult<Self> {
+        let layers = (0..N_LAYER).map(|li| {
+            let l = &m.layers[li];
+            Ok(CandleLayer {
+                wq:  make_var(&l.wq,  (N_EMBD, N_EMBD), device)?,
+                wk:  make_var(&l.wk,  (N_EMBD, N_EMBD), device)?,
+                wv:  make_var(&l.wv,  (N_EMBD, N_EMBD), device)?,
+                wo:  make_var(&l.wo,  (N_EMBD, N_EMBD), device)?,
+                fc1: make_var(&l.fc1, (MLP_DIM, N_EMBD), device)?,
+                fc2: make_var(&l.fc2, (N_EMBD, MLP_DIM), device)?,
+                m_wq: l.m_wq.clone(), v_wq: l.v_wq.clone(),
+                m_wk: l.m_wk.clone(), v_wk: l.v_wk.clone(),
+                m_wv: l.m_wv.clone(), v_wv: l.v_wv.clone(),
+                m_wo: l.m_wo.clone(), v_wo: l.v_wo.clone(),
+                m_fc1: l.m_fc1.clone(), v_fc1: l.v_fc1.clone(),
+                m_fc2: l.m_fc2.clone(), v_fc2: l.v_fc2.clone(),
+            })
+        }).collect::<CResult<Vec<_>>>()?;
+
+        Ok(Self {
+            wte:     make_var(&m.wte,     (m.vocab_size, N_EMBD), device)?,
+            wpe:     make_var(&m.wpe,     (BLOCK_SIZE, N_EMBD),   device)?,
+            lm_head: make_var(&m.lm_head, (m.vocab_size, N_EMBD), device)?,
+            layers,
+            m_wte: m.m_wte.clone(), v_wte: m.v_wte.clone(),
+            m_wpe: m.m_wpe.clone(), v_wpe: m.v_wpe.clone(),
+            m_lm_head: m.m_lm_head.clone(), v_lm_head: m.v_lm_head.clone(),
+            vocab_size: m.vocab_size,
+            device: device.clone(),
+        })
+    }
+
+    /// Download Var weights back to a CPU GPTModel (for inference / checkpointing).
+    pub fn to_gpt(&self) -> CResult<GPTModel> {
+        let vocab_size = self.vocab_size;
+
+        let mut rng = crate::rng::Rng::new(0); // dummy — weights come from Vars
+        let mut gpt = GPTModel::new(vocab_size, &mut rng);
+
+        gpt.wte     = var_to_vec(&self.wte)?;
+        gpt.wpe     = var_to_vec(&self.wpe)?;
+        gpt.lm_head = var_to_vec(&self.lm_head)?;
+        gpt.m_wte     = self.m_wte.clone(); gpt.v_wte     = self.v_wte.clone();
+        gpt.m_wpe     = self.m_wpe.clone(); gpt.v_wpe     = self.v_wpe.clone();
+        gpt.m_lm_head = self.m_lm_head.clone(); gpt.v_lm_head = self.v_lm_head.clone();
+
+        for li in 0..N_LAYER {
+            let cl = &self.layers[li];
+            gpt.layers[li].wq  = var_to_vec(&cl.wq)?;
+            gpt.layers[li].wk  = var_to_vec(&cl.wk)?;
+            gpt.layers[li].wv  = var_to_vec(&cl.wv)?;
+            gpt.layers[li].wo  = var_to_vec(&cl.wo)?;
+            gpt.layers[li].fc1 = var_to_vec(&cl.fc1)?;
+            gpt.layers[li].fc2 = var_to_vec(&cl.fc2)?;
+            gpt.layers[li].m_wq  = cl.m_wq.clone(); gpt.layers[li].v_wq  = cl.v_wq.clone();
+            gpt.layers[li].m_wk  = cl.m_wk.clone(); gpt.layers[li].v_wk  = cl.v_wk.clone();
+            gpt.layers[li].m_wv  = cl.m_wv.clone(); gpt.layers[li].v_wv  = cl.v_wv.clone();
+            gpt.layers[li].m_wo  = cl.m_wo.clone(); gpt.layers[li].v_wo  = cl.v_wo.clone();
+            gpt.layers[li].m_fc1 = cl.m_fc1.clone(); gpt.layers[li].v_fc1 = cl.v_fc1.clone();
+            gpt.layers[li].m_fc2 = cl.m_fc2.clone(); gpt.layers[li].v_fc2 = cl.v_fc2.clone();
+        }
+        Ok(gpt)
+    }
+
+    /// Replace a Var with a new tensor built from updated CPU weights.
+    #[allow(dead_code)]
+    pub fn set_var(v: &mut Var, data: &[f32], shape: (usize, usize), device: &Device) -> CResult<()> {
+        *v = make_var(data, shape, device)?;
+        Ok(())
+    }
+
+    /// Build a new Var from updated CPU weight data (used in train_candle update_var! macro).
+    #[allow(dead_code)]
+    pub fn set_var_ret(data: Vec<f32>, shape: (usize, usize), device: &Device) -> CResult<Var> {
+        make_var(&data, shape, device)
     }
 }

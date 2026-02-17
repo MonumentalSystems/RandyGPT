@@ -7,6 +7,7 @@ use std::collections::HashMap;
 pub struct Tokenizer {
     pub char_to_idx: HashMap<char, usize>,
     pub idx_to_char: Vec<char>,
+    #[allow(dead_code)]
     pub bos_id: usize,
     pub eos_id: usize,
     pub vocab_size: usize,

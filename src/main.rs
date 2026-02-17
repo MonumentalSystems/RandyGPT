@@ -14,12 +14,13 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use checkpoint::load_checkpoint;
+use checkpoint::{load_checkpoint, load_checkpoint_v2};
 use config::*;
-use model::GPTModel;
+use metal::METAL_DEVICE;
+use model::{CandleModel, GPTModel};
 use rng::Rng;
 use tokenizer::Tokenizer;
-use train::{estimate_loss, generate, train};
+use train::{estimate_loss, generate, train, train_candle};
 
 fn load_training_data(path: &str) -> std::io::Result<String> {
     let file = File::open(path)?;
@@ -122,9 +123,30 @@ fn main() -> std::io::Result<()> {
     println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
     println!();
 
+    // ── Force Metal init so we know which path to take ───────────────
+    let use_metal = METAL_DEVICE.is_some();
+    if use_metal {
+        println!("Metal GPU: enabled — training via Candle autograd");
+    } else {
+        println!("Metal GPU: unavailable — training on CPU (BLAS)");
+    }
+    println!();
+
     // ── Resume from checkpoint ────────────────────────────────────────
     let (iter_start, step_start, best_loss_start) = if let Some(ref ckpt) = resume_path {
-        match load_checkpoint(ckpt, &mut model) {
+        // Try RGPT0002 first (Metal), then fall back to RGPT0001 (CPU)
+        let result = if use_metal {
+            let device = METAL_DEVICE.as_ref().unwrap();
+            let mut cm = CandleModel::from_gpt(&model, device)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            load_checkpoint_v2(ckpt, &mut cm).map(|r| {
+                model = cm.to_gpt().unwrap();
+                r
+            }).or_else(|_| load_checkpoint(ckpt, &mut model))
+        } else {
+            load_checkpoint(ckpt, &mut model)
+        };
+        match result {
             Ok((it, st, bl)) => {
                 println!("✓ Resumed from '{}' — iter {}, step {}, best loss {:.4}", ckpt, it, st, bl);
                 println!();
@@ -163,8 +185,18 @@ fn main() -> std::io::Result<()> {
     }
 
     // ── Train ─────────────────────────────────────────────────────────
-    train(&mut model, &data, &val_data, iterations, &mut rng,
-        iter_start, step_start, best_loss_start, ctrlc_flag);
+    if use_metal {
+        let device = METAL_DEVICE.as_ref().unwrap();
+        let mut candle_model = CandleModel::from_gpt(&model, device)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        train_candle(&mut candle_model, &data, &val_data, iterations, &mut rng,
+            iter_start, step_start, best_loss_start, ctrlc_flag);
+        model = candle_model.to_gpt()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    } else {
+        train(&mut model, &data, &val_data, iterations, &mut rng,
+            iter_start, step_start, best_loss_start, ctrlc_flag);
+    }
 
     // ── Final loss estimate ───────────────────────────────────────────
     println!("Estimating final loss...");

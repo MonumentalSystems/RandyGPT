@@ -2,10 +2,11 @@
 /* Forward pass: per-token CPU and batched Metal paths               */
 /* ------------------------------------------------------------------ */
 
-use candle_core::Tensor;
+use candle_core::{Result as CResult, Tensor, D};
+use candle_nn::ops::softmax;
 use crate::config::*;
 use crate::metal::METAL_DEVICE;
-use crate::model::{GPTModel, PosActs};
+use crate::model::{CandleModel, GPTModel, PosActs};
 use crate::ops::{apply_dropout, linear_fwd, rmsnorm_fwd, softmax_fwd};
 use crate::rng::Rng;
 
@@ -247,4 +248,105 @@ fn forward_metal_logits_cpu(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>>
     let mut kv = (0..N_LAYER).map(|_| Vec::new()).collect();
     let (logits, _) = forward(tokens, model, &mut kv, false, None);
     logits
+}
+
+/// Fully-batched training forward pass via Candle autograd on Metal.
+/// tokens:  [BATCH_SIZE, BLOCK_SIZE] u32
+/// targets: [BATCH_SIZE, BLOCK_SIZE] u32
+/// Returns a scalar cross-entropy loss Tensor.
+pub fn forward_candle_train(
+    tokens:  &Tensor,
+    targets: &Tensor,
+    model:   &CandleModel,
+    _training: bool,
+) -> CResult<Tensor> {
+    let device = &model.device;
+    let (batch, seq_len) = tokens.dims2()?;
+
+    // ── Embeddings ────────────────────────────────────────────────────
+    // wte: [vocab, D], index per position → [B, T, D]
+    let tok_flat = tokens.flatten_all()?;                             // [B*T]
+    let tok_emb  = model.wte.as_tensor().index_select(&tok_flat, 0)? // [B*T, D]
+        .reshape((batch, seq_len, N_EMBD))?;
+
+    // wpe: [BLOCK_SIZE, D], slice first seq_len rows → [T, D] then broadcast
+    let pos_emb = model.wpe.as_tensor().narrow(0, 0, seq_len)?       // [T, D]
+        .unsqueeze(0)?;                                               // [1, T, D]
+
+    let mut x = tok_emb.broadcast_add(&pos_emb)?;                    // [B, T, D]
+
+    // ── Causal mask ───────────────────────────────────────────────────
+    // Upper-triangular -inf, shape [1, 1, T, T] for broadcasting over heads
+    let mask_data: Vec<f32> = (0..seq_len * seq_len)
+        .map(|i| if (i % seq_len) <= (i / seq_len) { 0.0f32 } else { f32::NEG_INFINITY })
+        .collect();
+    let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)?; // [1,1,T,T]
+
+    // ── Transformer layers ────────────────────────────────────────────
+    for li in 0..N_LAYER {
+        let layer = &model.layers[li];
+
+        // Attention pre-norm (RMSNorm: scale by 1/rms per token)
+        let xn = {
+            let sq = x.sqr()?;                                        // [B, T, D]
+            let ms = sq.mean_keepdim(D::Minus1)?;                     // [B, T, 1]
+            let scale = (ms + 1e-5f64)?.sqrt()?.recip()?;            // [B, T, 1]
+            x.broadcast_mul(&scale)?                                  // [B, T, D]
+        };
+
+        // QKV projections: flatten [B,T,D]→[B*T,D], matmul [D,D]^T, reshape back
+        let xn_2d = xn.reshape((batch * seq_len, N_EMBD))?;
+        let q = xn_2d.matmul(&layer.wq.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let k = xn_2d.matmul(&layer.wk.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let v = xn_2d.matmul(&layer.wv.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+
+        // Reshape to multi-head: [B, T, H, Dh] → [B, H, T, Dh]
+        let q = q.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?; // [B,H,T,Dh]
+        let k = k.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?;
+        let v = v.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?;
+
+        // Attention scores: [B, H, T, T]
+        let scale_f = (HEAD_DIM as f64).sqrt().recip();
+        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale_f, 0.0)?;
+        let scores = scores.broadcast_add(&mask)?;                    // apply causal mask
+        let attn_w = softmax(&scores, D::Minus1)?;                   // [B, H, T, T]
+
+        // Weighted sum: [B, H, T, T] × [B, H, T, Dh] → [B, H, T, Dh]
+        let attn_out = attn_w.matmul(&v)?;
+
+        // Merge heads: [B, H, T, Dh] → [B, T, D]
+        let attn_out = attn_out.transpose(1, 2)?
+            .contiguous()?
+            .reshape((batch, seq_len, N_EMBD))?;
+
+        // Output projection + residual: flatten → matmul → reshape → add
+        let attn_2d = attn_out.reshape((batch * seq_len, N_EMBD))?;
+        let proj = attn_2d.matmul(&layer.wo.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        x = (x + proj)?;                                              // residual
+
+        // MLP pre-norm
+        let xn_mlp = {
+            let sq = x.sqr()?;
+            let ms = sq.mean_keepdim(D::Minus1)?;
+            let scale = (ms + 1e-5f64)?.sqrt()?.recip()?;
+            x.broadcast_mul(&scale)?
+        };
+
+        // fc1 → squared ReLU → fc2 + residual
+        let xnm_2d = xn_mlp.reshape((batch * seq_len, N_EMBD))?;
+        let h1  = xnm_2d.matmul(&layer.fc1.as_tensor().t()?)?.reshape((batch, seq_len, MLP_DIM))?;
+        let h1r = h1.relu()?;
+        let h2  = h1r.mul(&h1r)?;                                     // squared ReLU [B, T, 4D]
+        let h2_2d = h2.reshape((batch * seq_len, MLP_DIM))?;
+        let mlp_out = h2_2d.matmul(&layer.fc2.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        x = (x + mlp_out)?;
+    }
+
+    // ── LM head: [B, T, D] → [B*T, V] ───────────────────────────────
+    let x_2d = x.reshape((batch * seq_len, N_EMBD))?;
+    let logits_2d = x_2d.matmul(&model.lm_head.as_tensor().t()?)?;   // [B*T, V]
+
+    // ── Cross-entropy loss ────────────────────────────────────────────
+    let targets_flat = targets.flatten_all()?;                        // [B*T] u32
+    candle_nn::loss::cross_entropy(&logits_2d, &targets_flat)
 }

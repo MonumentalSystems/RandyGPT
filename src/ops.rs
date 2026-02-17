@@ -30,6 +30,7 @@ mod blas {
         );
 
         // A += alpha * x * y^T   (outer-product update)
+        #[allow(dead_code)]
         pub fn cblas_sger(
             order: c_int,
             m: c_int, n: c_int,
@@ -72,6 +73,7 @@ pub fn linear_fwd(x: &[f32], w: &[f32], nout: usize, nin: usize, out: &mut [f32]
 // Linear backward:
 //   d_x[nin]       = W^T · d_out           (cblas_sgemv with TRANS)
 //   d_w[nout×nin] += d_out ⊗ x             (cblas_sger outer product)
+#[allow(dead_code)]
 pub fn linear_bwd(
     d_out: &[f32],
     x: &[f32],
