@@ -202,6 +202,15 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    // ── Sync resumed weights to CPU model before initial estimate ────
+    // When resuming on Metal, the loaded weights live in the CandleModel.
+    // Sync them back to `model` now so estimate_loss sees the actual
+    // checkpoint state, not freshly-initialized random weights.
+    if let Some((ref cm, _, _, _, _)) = candle_resume {
+        model = cm.to_gpt()
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+    }
+
     // ── Initial loss estimate ─────────────────────────────────────────
     println!("Estimating initial loss...");
     let initial_loss     = estimate_loss(&model, &data, 10, &mut rng);
