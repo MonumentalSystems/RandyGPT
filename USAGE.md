@@ -167,7 +167,7 @@ If Metal is unavailable (non-Apple hardware or driver issue), the code falls bac
 1. **Always use `--release`** — debug builds are 20–50× slower
 2. **Use a checkpoint interval** — the default 100-iter checkpoint means at most 100 iters lost if interrupted
 3. **Prefer `checkpoint_best.bin`** for long resumptions — it reflects the model's best state, not just the most recent
-4. **RSS memory** is ~2-3 GB for the default config on Metal (unified memory holds GPU activations + autograd tape)
+4. **RSS memory**: `real` RSS stays ~400 MB; Activity Monitor shows ~3 GB — that's normal on Apple Silicon. Metal tensors live in unified memory, which shows up in the process virtual address space but not in RSS.
 5. **First iteration is slower** — Metal JIT-compiles kernels on the first batch; subsequent iters are at full speed
 
 ## Troubleshooting

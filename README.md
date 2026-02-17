@@ -111,7 +111,9 @@ If `train.txt` is absent, the model falls back to a tiny built-in sample.
 | Version | ms/iter | 1000 iter | Notes |
 |---------|---------|-----------|-------|
 | v0.7.1 CPU | ~964ms | ~96s | 12 cores, batch=128, SGEMM backward |
-| **v0.8.0 GPU** | **~518ms** | **~52s** | Metal autograd, batch=128 |
+| **v0.8.0 GPU** | **~490ms** | **~49s** | Metal autograd, batch=128, 60.9% GPU |
+
+RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory mapped into virtual space, not CPU-resident).
 
 ## Parameter Scaling Reference
 

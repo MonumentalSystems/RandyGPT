@@ -23,12 +23,13 @@ All notable changes to randyGPT are documented here.
 | **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 |
 | **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
 | **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules |
-| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~2-3GB |
-| **Speed (1000 iter)** | N/A | ~600s† | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s‡ | ~52s§ |
+| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~400MB real† |
+| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ |
 
-†Estimated
-‡SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
-§Candle Metal autograd (~518ms/iter steady-state, ~1.9× vs v0.7.1 CPU); batch=128
+†RSS ~400MB real; Activity Monitor shows ~3GB (Metal unified memory in virtual space — not CPU-resident)
+‡Estimated
+§SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
+¶Candle Metal autograd (~490ms/iter steady-state, ~2× vs v0.7.1 CPU); batch=128; 60.9% GPU utilization
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
 
 ---
@@ -47,7 +48,7 @@ All notable changes to randyGPT are documented here.
 - `loss.backward()` → `GradStore` replaces hand-written two-pass SGEMM backward
 - **Optimizer stays on CPU (Strategy A)**: AdamW moments remain `Vec<f32>`, `adam_step()` reused unchanged
 - Gradients pulled off GPU via `.flatten_all().to_vec1::<f32>()`, clipped, Adam-updated, re-uploaded via `Var::set()`
-- **Measured speedup**: ~518ms/iter steady-state vs ~964ms/iter (v0.7.1 CPU) = **~1.9×**
+- **Measured speedup**: ~490ms/iter steady-state vs ~964ms/iter (v0.7.1 CPU) = **~2×**; 60.9% GPU utilization
 
 #### RGPT0002 Checkpoint Format
 - New magic bytes `b"RGPT0002"` — incompatible with prior RGPT0001 checkpoints
