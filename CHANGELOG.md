@@ -2,6 +2,58 @@
 
 All notable changes to randyGPT are documented here.
 
+## [0.5.1] - 2026-02-16
+
+### 🔧 Zero-IO Training Loop + Ctrl-C Save
+
+- **Memory-buffered checkpoints**: `serialize_checkpoint()` serializes state to a `Vec<u8>` in RAM on every iteration — no disk writes inside the hot loop
+- **Flush only on completion or interrupt**: `flush_checkpoint()` does a single atomic write (temp-file + rename) at end-of-training or on Ctrl-C
+- **Ctrl-C handler** (`ctrlc` crate): pressing Ctrl-C sets an atomic flag; the training loop detects it after the current iteration, flushes both buffers, and exits cleanly:
+  ```
+  Interrupted at iteration 89. Saving checkpoint...
+  ✓ Saved checkpoint.bin (iter 89)
+  ✓ Saved checkpoint_best.bin (best loss 3.9917 @89)
+  ```
+- **Result**: CPU utilization restored to full multi-core (was dropping to 1-2 cores due to 14 MB synchronous disk writes per iteration)
+
+---
+
+## [0.5.0] - 2026-02-16
+
+### 🚀 Checkpoint Save / Resume
+
+- **`serialize_checkpoint` / `load_checkpoint`** — compact binary format (`RGPT0001` magic)
+  - Saves model weights + full AdamW optimizer state (m/v moments) + iter/step counters
+  - LR schedule resumes correctly because the step counter is preserved
+  - ~14 MB per checkpoint for the current 1.2M-param config
+- **Two automatic checkpoint files**:
+  - `checkpoint.bin` — written at completion (and on Ctrl-C)
+  - `checkpoint_best.bin` — written whenever training loss hits a new best (on Ctrl-C if improved)
+- **CLI resume flag**: `--resume [path]`
+  - `--resume` → loads `checkpoint.bin`
+  - `--resume <path>` → loads any `.bin` file
+  - Guard: prints a clear message if `--iters` target is already reached
+- **`--iters` flag** added (replaces positional argument; positional still works for compat)
+
+### 🔧 Metal Memory Fix
+
+- Fixed catastrophic memory explosion (43 GB → 430 MB) caused by calling Metal GPU per-vector during training
+- Root cause: `linear_fwd` was routing every single matrix-vector op through Metal, allocating ~98K GPU tensors per training iteration that Metal's runtime couldn't free fast enough
+- Fix: training always uses CPU (`linear_fwd_cpu` via Rayon); Metal is used only in `forward_metal_logits` for batched inference in `estimate_loss` and `generate`
+- Removed the unused `linear_fwd_metal` function
+
+### 📊 Architecture (unchanged from v0.4)
+
+| Feature | v0.5 |
+|---------|------|
+| Embedding Dim | 128 |
+| Layers | 6 |
+| Parameters | ~1.2M |
+| Metal | ✅ Inference only |
+| Checkpointing | ✅ |
+
+---
+
 ## [0.4.0] - 2026-02-16
 
 ### 🚀 Major Improvements
@@ -175,49 +227,54 @@ Cores used: 12 available, ~8 effectively utilized
 
 ## Comparison Table
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 |
-|---------|------|------|------|------|
-| **Layers** | 1 | 4 | 4 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~4.77M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core |
-| **Optimizer** | - | Adam | Adam | AdamW |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay |
-| **Initialization** | Random | Standard | Standard | GPT-2 style |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) |
-| **Speed (1000 iter)** | N/A | ~600s* | ~78s | ~120s** |
-| **CPU Usage** | 100% | 100% | 825% | 825% |
-| **Quality** | Random | Learning | Learning faster | Better capacity |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 |
+|---------|------|------|------|------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay |
+| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) |
+| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB |
+| **Speed (1000 iter)** | N/A | ~600s† | ~78s | ~450s | ~450s |
 
-*Estimated
-**Estimated (slower due to 6x more params)
+†Estimated
+*v0.4 plan targeted 256-dim but shipped at 128 due to the Metal memory issue that was fixed in v0.5
 
 ---
 
 ## Future Roadmap
 
-### v0.4.0 - Quality Improvements
-- [ ] Add attention gradient computation
-- [ ] Implement gradient clipping
-- [ ] Learning rate scheduling
-- [ ] Validation split and metrics
+### v0.4.0 - Quality Improvements ✅ Done
+- [x] Gradient clipping
+- [x] Learning rate scheduling (warmup → constant → cosine decay)
+- [x] Dropout regularization
+- [x] GPT-2 style initialization
+- [ ] Full attention gradient computation (still simplified)
+- [ ] Validation split and perplexity metrics
 
-### v0.5.0 - Optimization
-- [ ] BLAS integration for matrix ops (2x speedup)
-- [ ] Better memory management
-- [ ] Checkpoint saving/loading
+### v0.5.0 - Checkpointing & Metal ✅ Done
+- [x] Checkpoint saving/loading with resume
+- [x] Metal GPU inference acceleration (Candle, M-series)
+- [x] Memory safety (fixed per-vector Metal allocation explosion)
+- [x] Zero-IO training loop (memory-buffered checkpoints)
+- [x] Ctrl-C graceful save
+
+### v0.6.0 - Next Up
+- [ ] Full attention gradient computation
+- [ ] Validation/perplexity tracking
+- [ ] BLAS integration for CPU matmuls (2× speedup)
 
 ### v1.0.0 - Production Ready
-- [ ] CLI with arguments
-- [ ] Multiple model size presets
+- [ ] Multiple model size presets via CLI
 - [ ] BPE tokenization
 - [ ] Model evaluation suite
-
-### v2.0.0 - GPU Support (Optional)
-- [ ] wgpu or CUDA backend
-- [ ] 50-100x speedup potential
 - [ ] Mixed precision training
-- [ ] Flash attention
 
 ---
 

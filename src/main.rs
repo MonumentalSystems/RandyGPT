@@ -1,13 +1,15 @@
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write, Read};
 use std::path::Path;
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use rayon::prelude::*;
+use candle_core::{Device, Tensor, Result as CandleResult};
 
 /* ------------------------------------------------------------------ */
 /* Enhanced Model hyper-parameters                                    */
 /* ------------------------------------------------------------------ */
-const N_EMBD: usize = 256;        // Scaled up from 128 (3M params)
+const N_EMBD: usize = 128;        // Scaled up from 128 (3M params)
 const N_HEAD: usize = 8;          // Keep 8 heads
 const N_LAYER: usize = 6;         // Scaled up from 4 (deeper model)
 const BLOCK_SIZE: usize = 64;     // Keep 64 context
@@ -27,6 +29,58 @@ const EPSILON: f32 = 1e-8;
 const MAX_ITERS: usize = 1000;
 const EVAL_INTERVAL: usize = 100;
 const GRAD_CLIP: f32 = 1.0;  // Gradient clipping threshold
+const USE_METAL: bool = true;  // Enable Metal GPU acceleration
+
+/* ------------------------------------------------------------------ */
+/* Metal GPU Acceleration                                              */
+/* ------------------------------------------------------------------ */
+
+// Global Metal device (initialized once)
+lazy_static::lazy_static! {
+    static ref METAL_DEVICE: Option<Device> = {
+        if USE_METAL {
+            match Device::new_metal(0) {
+                Ok(dev) => {
+                    eprintln!("✓ Metal GPU enabled on device: {:?}", dev);
+                    Some(dev)
+                }
+                Err(e) => {
+                    eprintln!("⚠ Metal GPU unavailable: {}", e);
+                    None
+                }
+            }
+        } else {
+            None
+        }
+    };
+}
+
+// Metal-accelerated batched matrix multiply: out = x * W^T
+// x: [seq_len, nin], w: [nout, nin] → out: [seq_len, nout]
+fn metal_matmul_batch(
+    x: &[f32],     // Input: [seq_len x nin] row-major
+    w: &[f32],     // Weight: [nout x nin] row-major
+    seq_len: usize,
+    nin: usize,
+    nout: usize,
+    out: &mut [f32], // Output: [seq_len x nout] row-major
+) -> CandleResult<()> {
+    let device = METAL_DEVICE.as_ref().unwrap();
+
+    // Upload to Metal device
+    let x_t = Tensor::from_slice(x, (seq_len, nin), device)?;
+    let w_t = Tensor::from_slice(w, (nout, nin), device)?;
+
+    // Compute x * W^T → [seq_len, nout]
+    let result = x_t.matmul(&w_t.t()?)?;
+
+    // Copy back to CPU
+    let flat = result.flatten_all()?.to_vec1::<f32>()?;
+    out.copy_from_slice(&flat);
+
+    Ok(())
+}
+
 
 /* ------------------------------------------------------------------ */
 /* Minimal xorshift PRNG                                             */
@@ -278,13 +332,18 @@ impl GPTModel {
 /* Math primitives                                                    */
 /* ------------------------------------------------------------------ */
 fn linear_fwd(x: &[f32], w: &[f32], nout: usize, nin: usize, out: &mut [f32]) {
+    // Training always uses CPU — Metal is only used in batched inference (forward_metal_logits).
+    // Per-vector Metal calls allocate GPU memory tens of thousands of times per iteration,
+    // causing catastrophic memory exhaustion. Batched matmuls (forward_metal_logits) are
+    // used for estimate_loss and generate instead.
+    linear_fwd_cpu(x, w, nout, nin, out);
+}
+
+// CPU fallback implementation
+fn linear_fwd_cpu(x: &[f32], w: &[f32], nout: usize, nin: usize, out: &mut [f32]) {
     for r in 0..nout {
-        let mut s = 0.0;
-        let wr = &w[r * nin..(r + 1) * nin];
-        for c in 0..nin {
-            s += wr[c] * x[c];
-        }
-        out[r] = s;
+        // zip-based dot product — LLVM can auto-vectorize this with SIMD
+        out[r] = w[r * nin..(r + 1) * nin].iter().zip(x.iter()).map(|(wi, xi)| wi * xi).sum();
     }
 }
 
@@ -469,6 +528,144 @@ fn forward(
     }
 
     (all_logits, all_acts)
+}
+
+/* ------------------------------------------------------------------ */
+/* Metal-Accelerated Full Sequence Forward Pass                      */
+/* ------------------------------------------------------------------ */
+
+// Metal forward: processes all seq_len positions in batched matmuls
+// Returns only logits (no activations for backward).
+// Use this during loss estimation/generation for pure speed.
+fn forward_metal_logits(
+    tokens: &[usize],
+    model: &GPTModel,
+) -> Vec<Vec<f32>> {
+    let device = match METAL_DEVICE.as_ref() {
+        Some(d) => d,
+        None => return forward_metal_logits_cpu(tokens, model),
+    };
+
+    let seq_len = tokens.len();
+
+    // Helper: batch matmul on Metal - x [T, nin] * W^T [nin, nout] → [T, nout]
+    let metal_mm = |x_data: &[f32], t: usize, nin: usize,
+                    w_data: &[f32], nout: usize| -> Vec<f32> {
+        let x_t = Tensor::from_slice(x_data, (t, nin), device).unwrap();
+        let w_t = Tensor::from_slice(w_data, (nout, nin), device).unwrap();
+        x_t.matmul(&w_t.t().unwrap()).unwrap()
+            .flatten_all().unwrap()
+            .to_vec1::<f32>().unwrap()
+    };
+
+    // Build input embeddings for all positions [seq_len, N_EMBD]
+    let mut x_flat: Vec<f32> = vec![0.0; seq_len * N_EMBD];
+    for (pos, &tok) in tokens.iter().enumerate() {
+        for i in 0..N_EMBD {
+            x_flat[pos * N_EMBD + i] =
+                model.wte[tok * N_EMBD + i] + model.wpe[pos * N_EMBD + i];
+        }
+    }
+
+    // Run through transformer layers
+    for li in 0..N_LAYER {
+        // RMSNorm over all positions (CPU - cheap elementwise op)
+        let mut xn_flat = vec![0.0f32; seq_len * N_EMBD];
+        for pos in 0..seq_len {
+            rmsnorm_fwd(
+                &x_flat[pos * N_EMBD..(pos + 1) * N_EMBD],
+                N_EMBD,
+                &mut xn_flat[pos * N_EMBD..(pos + 1) * N_EMBD],
+            );
+        }
+
+        // Q, K, V projections on Metal [seq_len, N_EMBD] → [seq_len, N_EMBD]
+        let q_flat = metal_mm(&xn_flat, seq_len, N_EMBD, &model.layers[li].wq, N_EMBD);
+        let k_flat = metal_mm(&xn_flat, seq_len, N_EMBD, &model.layers[li].wk, N_EMBD);
+        let v_flat = metal_mm(&xn_flat, seq_len, N_EMBD, &model.layers[li].wv, N_EMBD);
+
+        // Attention computation (CPU - quadratic in seq_len but seq_len=64 is small)
+        let scale = 1.0 / (HEAD_DIM as f32).sqrt();
+        let mut attn_out = vec![0.0f32; seq_len * N_EMBD];
+
+        for h in 0..N_HEAD {
+            let hs = h * HEAD_DIM;
+            for pos in 0..seq_len {
+                // Compute scores vs all previous positions (causal)
+                let mut scores = vec![0.0f32; pos + 1];
+                for t in 0..=pos {
+                    let mut dot = 0.0f32;
+                    for j in 0..HEAD_DIM {
+                        dot += q_flat[pos * N_EMBD + hs + j] * k_flat[t * N_EMBD + hs + j];
+                    }
+                    scores[t] = dot * scale;
+                }
+                // Softmax
+                let mut weights = vec![0.0f32; pos + 1];
+                softmax_fwd(&scores, pos + 1, &mut weights, 1.0);
+                // Weighted value sum
+                for t in 0..=pos {
+                    for j in 0..HEAD_DIM {
+                        attn_out[pos * N_EMBD + hs + j] +=
+                            weights[t] * v_flat[t * N_EMBD + hs + j];
+                    }
+                }
+            }
+        }
+
+        // Output projection on Metal [seq_len, N_EMBD] → [seq_len, N_EMBD]
+        let attn_proj = metal_mm(&attn_out, seq_len, N_EMBD, &model.layers[li].wo, N_EMBD);
+
+        // Residual connection
+        let mut x_mid = vec![0.0f32; seq_len * N_EMBD];
+        for i in 0..seq_len * N_EMBD {
+            x_mid[i] = x_flat[i] + attn_proj[i];
+        }
+
+        // MLP: RMSNorm (CPU) → fc1 (Metal) → squared ReLU (CPU) → fc2 (Metal) → residual
+        let mut xn_mlp = vec![0.0f32; seq_len * N_EMBD];
+        for pos in 0..seq_len {
+            rmsnorm_fwd(
+                &x_mid[pos * N_EMBD..(pos + 1) * N_EMBD],
+                N_EMBD,
+                &mut xn_mlp[pos * N_EMBD..(pos + 1) * N_EMBD],
+            );
+        }
+
+        // fc1: [seq_len, N_EMBD] → [seq_len, MLP_DIM]
+        let h1_flat = metal_mm(&xn_mlp, seq_len, N_EMBD, &model.layers[li].fc1, MLP_DIM);
+
+        // Squared ReLU (CPU - elementwise)
+        let mut h2_flat = vec![0.0f32; seq_len * MLP_DIM];
+        for i in 0..h2_flat.len() {
+            let v = h1_flat[i];
+            h2_flat[i] = if v > 0.0 { v * v } else { 0.0 };
+        }
+
+        // fc2: [seq_len, MLP_DIM] → [seq_len, N_EMBD]
+        let mlp_out = metal_mm(&h2_flat, seq_len, MLP_DIM, &model.layers[li].fc2, N_EMBD);
+
+        // MLP residual
+        for i in 0..seq_len * N_EMBD {
+            x_flat[i] = x_mid[i] + mlp_out[i];
+        }
+    }
+
+    // Final LM head: [seq_len, N_EMBD] → [seq_len, vocab_size]
+    let logits_flat = metal_mm(&x_flat, seq_len, N_EMBD, &model.lm_head, model.vocab_size);
+
+    // Split into per-position logits
+    logits_flat
+        .chunks(model.vocab_size)
+        .map(|c| c.to_vec())
+        .collect()
+}
+
+// CPU fallback when Metal is not available
+fn forward_metal_logits_cpu(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>> {
+    let mut kv = (0..N_LAYER).map(|_| Vec::new()).collect();
+    let (logits, _) = forward(tokens, model, &mut kv, false, None);
+    logits
 }
 
 /* ------------------------------------------------------------------ */
@@ -659,13 +856,19 @@ fn adam_step(
     t: usize,
     lr: f32,
 ) {
+    // Precompute bias corrections once — powf() is expensive, no need to call it per param
     let t_f = t as f32;
-    for i in 0..params.len() {
-        m[i] = BETA1 * m[i] + (1.0 - BETA1) * grads[i];
-        v[i] = BETA2 * v[i] + (1.0 - BETA2) * grads[i] * grads[i];
+    let bc1 = 1.0 - BETA1.powf(t_f);
+    let bc2 = 1.0 - BETA2.powf(t_f);
+    let one_m_b1 = 1.0 - BETA1;
+    let one_m_b2 = 1.0 - BETA2;
 
-        let m_hat = m[i] / (1.0 - BETA1.powf(t_f));
-        let v_hat = v[i] / (1.0 - BETA2.powf(t_f));
+    for i in 0..params.len() {
+        m[i] = BETA1 * m[i] + one_m_b1 * grads[i];
+        v[i] = BETA2 * v[i] + one_m_b2 * grads[i] * grads[i];
+
+        let m_hat = m[i] / bc1;
+        let v_hat = v[i] / bc2;
 
         // AdamW: decoupled weight decay
         params[i] -= lr * (m_hat / (v_hat.sqrt() + EPSILON) + WEIGHT_DECAY * params[i]);
@@ -674,88 +877,250 @@ fn adam_step(
 
 // Zero out gradients
 fn zero_grads(model: &mut GPTModel) {
-    for i in 0..model.d_wte.len() {
-        model.d_wte[i] = 0.0;
-    }
-    for i in 0..model.d_wpe.len() {
-        model.d_wpe[i] = 0.0;
-    }
-    for i in 0..model.d_lm_head.len() {
-        model.d_lm_head[i] = 0.0;
-    }
-
+    model.d_wte.fill(0.0);
+    model.d_wpe.fill(0.0);
+    model.d_lm_head.fill(0.0);
     for layer in &mut model.layers {
-        for i in 0..layer.d_wq.len() {
-            layer.d_wq[i] = 0.0;
-        }
-        for i in 0..layer.d_wk.len() {
-            layer.d_wk[i] = 0.0;
-        }
-        for i in 0..layer.d_wv.len() {
-            layer.d_wv[i] = 0.0;
-        }
-        for i in 0..layer.d_wo.len() {
-            layer.d_wo[i] = 0.0;
-        }
-        for i in 0..layer.d_fc1.len() {
-            layer.d_fc1[i] = 0.0;
-        }
-        for i in 0..layer.d_fc2.len() {
-            layer.d_fc2[i] = 0.0;
-        }
+        layer.d_wq.fill(0.0);
+        layer.d_wk.fill(0.0);
+        layer.d_wv.fill(0.0);
+        layer.d_wo.fill(0.0);
+        layer.d_fc1.fill(0.0);
+        layer.d_fc2.fill(0.0);
     }
 }
 
-// Struct to hold gradients for a single example
+// Struct to hold gradients for a single example.
+// Layer weight gradients are stored as flat contiguous Vecs (N_LAYER × per-layer-size)
+// instead of Vec<Vec<f32>> for better cache locality and SIMD-friendly accumulation.
+// Access layer li of d_wq via: grads.d_wq[li * N_EMBD*N_EMBD .. (li+1) * N_EMBD*N_EMBD]
+// or via the helper method .layer_slice(field, li, stride).
 #[derive(Clone)]
 struct GradientBuffer {
     d_wte: Vec<f32>,
     d_wpe: Vec<f32>,
     d_lm_head: Vec<f32>,
-    d_wq: Vec<Vec<f32>>,
-    d_wk: Vec<Vec<f32>>,
-    d_wv: Vec<Vec<f32>>,
-    d_wo: Vec<Vec<f32>>,
-    d_fc1: Vec<Vec<f32>>,
-    d_fc2: Vec<Vec<f32>>,
+    // Flat: [layer0 | layer1 | ... | layerN-1], each N_EMBD*N_EMBD floats
+    d_wq: Vec<f32>,
+    d_wk: Vec<f32>,
+    d_wv: Vec<f32>,
+    d_wo: Vec<f32>,
+    // Flat: each MLP_DIM*N_EMBD floats
+    d_fc1: Vec<f32>,
+    d_fc2: Vec<f32>,
 }
 
 impl GradientBuffer {
     fn new(vocab_size: usize) -> Self {
         Self {
-            d_wte: vec![0.0; vocab_size * N_EMBD],
-            d_wpe: vec![0.0; BLOCK_SIZE * N_EMBD],
+            d_wte:    vec![0.0; vocab_size * N_EMBD],
+            d_wpe:    vec![0.0; BLOCK_SIZE * N_EMBD],
             d_lm_head: vec![0.0; vocab_size * N_EMBD],
-            d_wq: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
-            d_wk: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
-            d_wv: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
-            d_wo: vec![vec![0.0; N_EMBD * N_EMBD]; N_LAYER],
-            d_fc1: vec![vec![0.0; MLP_DIM * N_EMBD]; N_LAYER],
-            d_fc2: vec![vec![0.0; N_EMBD * MLP_DIM]; N_LAYER],
+            d_wq:  vec![0.0; N_LAYER * N_EMBD * N_EMBD],
+            d_wk:  vec![0.0; N_LAYER * N_EMBD * N_EMBD],
+            d_wv:  vec![0.0; N_LAYER * N_EMBD * N_EMBD],
+            d_wo:  vec![0.0; N_LAYER * N_EMBD * N_EMBD],
+            d_fc1: vec![0.0; N_LAYER * MLP_DIM * N_EMBD],
+            d_fc2: vec![0.0; N_LAYER * N_EMBD * MLP_DIM],
         }
+    }
+
+    // Return the slice for layer `li` of a flat N_LAYER×stride array
+    #[inline(always)]
+    fn layer<'a>(field: &'a [f32], li: usize, stride: usize) -> &'a [f32] {
+        &field[li * stride .. (li + 1) * stride]
+    }
+
+    #[inline(always)]
+    fn layer_mut<'a>(field: &'a mut Vec<f32>, li: usize, stride: usize) -> &'a mut [f32] {
+        &mut field[li * stride .. (li + 1) * stride]
     }
 }
 
+/* ------------------------------------------------------------------ */
+/* Checkpoint save / load                                             */
+/* ------------------------------------------------------------------ */
+
+// File format (all little-endian):
+//   [0..8]   magic   b"RGPT0001"
+//   [8..12]  vocab_size  u32
+//   [12..16] iter        u32   (last completed iteration, 0-based)
+//   [16..20] step        u32   (Adam step counter)
+//   [20..24] best_loss   f32
+//   [24..]   flat f32 arrays in order:
+//              wte, wpe, lm_head,
+//              per layer: wq,wk,wv,wo,fc1,fc2,
+//              m_wte,v_wte, m_wpe,v_wpe, m_lm_head,v_lm_head,
+//              per layer: m_wq,v_wq, m_wk,v_wk, m_wv,v_wv,
+//                         m_wo,v_wo, m_fc1,v_fc1, m_fc2,v_fc2
+
+// Write f32 slice to a byte buffer (in-memory, no disk I/O)
+fn write_f32_slice_buf(buf: &mut Vec<u8>, s: &[f32]) {
+    buf.reserve(s.len() * 4);
+    for &v in s {
+        buf.extend_from_slice(&v.to_le_bytes());
+    }
+}
+
+// Flush an in-memory checkpoint buffer atomically to disk.
+// Writes to a temp file then renames so we never leave a partial file.
+fn flush_checkpoint(path: &str, buf: &[u8]) -> std::io::Result<()> {
+    let tmp = format!("{}.tmp", path);
+    {
+        let mut f = File::create(&tmp)?;
+        f.write_all(buf)?;
+        f.flush()?;
+    }
+    std::fs::rename(&tmp, path)?;
+    Ok(())
+}
+
+
+fn read_f32_slice(f: &mut File, n: usize) -> std::io::Result<Vec<f32>> {
+    let mut buf = vec![0u8; n * 4];
+    f.read_exact(&mut buf)?;
+    Ok(buf.chunks_exact(4).map(|b| f32::from_le_bytes([b[0],b[1],b[2],b[3]])).collect())
+}
+
+// Serialize checkpoint to an in-memory byte buffer — zero disk I/O.
+// Call flush_checkpoint() to actually write to disk.
+fn serialize_checkpoint(
+    model: &GPTModel,
+    iter: usize,
+    step: usize,
+    best_loss: f32,
+) -> Vec<u8> {
+    // Pre-size: header(24) + all f32 params * 4 bytes each, ×2 for Adam moments
+    let n_params = model.wte.len() + model.wpe.len() + model.lm_head.len()
+        + N_LAYER * (model.layers[0].wq.len() * 6); // wq+wk+wv+wo+fc1+fc2
+    let mut buf: Vec<u8> = Vec::with_capacity(24 + n_params * 4 * 3); // weights + 2× moments
+
+    // Header
+    buf.extend_from_slice(b"RGPT0001");
+    buf.extend_from_slice(&(model.vocab_size as u32).to_le_bytes());
+    buf.extend_from_slice(&(iter as u32).to_le_bytes());
+    buf.extend_from_slice(&(step as u32).to_le_bytes());
+    buf.extend_from_slice(&best_loss.to_le_bytes());
+    // Weights
+    write_f32_slice_buf(&mut buf, &model.wte);
+    write_f32_slice_buf(&mut buf, &model.wpe);
+    write_f32_slice_buf(&mut buf, &model.lm_head);
+    for li in 0..N_LAYER {
+        write_f32_slice_buf(&mut buf, &model.layers[li].wq);
+        write_f32_slice_buf(&mut buf, &model.layers[li].wk);
+        write_f32_slice_buf(&mut buf, &model.layers[li].wv);
+        write_f32_slice_buf(&mut buf, &model.layers[li].wo);
+        write_f32_slice_buf(&mut buf, &model.layers[li].fc1);
+        write_f32_slice_buf(&mut buf, &model.layers[li].fc2);
+    }
+    // Adam moments
+    write_f32_slice_buf(&mut buf, &model.m_wte);   write_f32_slice_buf(&mut buf, &model.v_wte);
+    write_f32_slice_buf(&mut buf, &model.m_wpe);   write_f32_slice_buf(&mut buf, &model.v_wpe);
+    write_f32_slice_buf(&mut buf, &model.m_lm_head); write_f32_slice_buf(&mut buf, &model.v_lm_head);
+    for li in 0..N_LAYER {
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_wq); write_f32_slice_buf(&mut buf, &model.layers[li].v_wq);
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_wk); write_f32_slice_buf(&mut buf, &model.layers[li].v_wk);
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_wv); write_f32_slice_buf(&mut buf, &model.layers[li].v_wv);
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_wo); write_f32_slice_buf(&mut buf, &model.layers[li].v_wo);
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_fc1); write_f32_slice_buf(&mut buf, &model.layers[li].v_fc1);
+        write_f32_slice_buf(&mut buf, &model.layers[li].m_fc2); write_f32_slice_buf(&mut buf, &model.layers[li].v_fc2);
+    }
+    buf
+}
+
+/// Returns (iter_start, step, best_loss) on success.
+fn load_checkpoint(path: &str, model: &mut GPTModel) -> std::io::Result<(usize, usize, f32)> {
+    let mut f = File::open(path)?;
+    // Magic
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != b"RGPT0001" {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("Bad magic bytes in checkpoint {}", path)));
+    }
+    // Header scalars
+    let mut u32buf = [0u8; 4];
+    f.read_exact(&mut u32buf)?; let ckpt_vocab = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let iter       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let step       = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let best_loss  = f32::from_le_bytes(u32buf);
+
+    if ckpt_vocab != model.vocab_size {
+        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData,
+            format!("Checkpoint vocab_size {} != model vocab_size {}", ckpt_vocab, model.vocab_size)));
+    }
+    // Weights
+    model.wte      = read_f32_slice(&mut f, model.wte.len())?;
+    model.wpe      = read_f32_slice(&mut f, model.wpe.len())?;
+    model.lm_head  = read_f32_slice(&mut f, model.lm_head.len())?;
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+    }
+    // Adam moments
+    model.m_wte     = read_f32_slice(&mut f, model.wte.len())?;
+    model.v_wte     = read_f32_slice(&mut f, model.wte.len())?;
+    model.m_wpe     = read_f32_slice(&mut f, model.wpe.len())?;
+    model.v_wpe     = read_f32_slice(&mut f, model.wpe.len())?;
+    model.m_lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+    model.v_lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].m_wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wq  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wk  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wv  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].v_wo  = read_f32_slice(&mut f, n_sq)?;
+        model.layers[li].m_fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].v_fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+        model.layers[li].m_fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+        model.layers[li].v_fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+    }
+    Ok((iter + 1, step, best_loss))  // iter+1: resume *after* the saved iter
+}
+
 // Training function with Rayon parallelization
+// iter_start / step_start / best_loss_start are restored from a checkpoint when resuming.
+// ctrlc_flag: set to true by the Ctrl-C handler; train() flushes and exits cleanly.
 fn train(
     model: &mut GPTModel,
     data: &[usize],
-    iterations: usize,
+    iterations: usize,   // total iterations to reach (not additional)
     rng: &mut Rng,
+    iter_start: usize,
+    step_start: usize,
+    best_loss_start: f32,
+    ctrlc_flag: Arc<AtomicBool>,
 ) {
     println!("=== Starting Training (Multi-Core with Rayon) ===");
-    println!("Iterations: {}", iterations);
+    if iter_start > 0 {
+        println!("Resuming from iteration {}", iter_start);
+    }
+    println!("Iterations: {} → {}", iter_start, iterations);
     println!("Batch size: {}", BATCH_SIZE);
     println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
     println!("Gradient clipping: {}", GRAD_CLIP);
     println!("Cores available: {}", rayon::current_num_threads());
     println!();
 
-    let mut step = 0;
-    let mut best_loss = f32::INFINITY;
-    let mut best_iter = 0;
+    let mut step = step_start;
+    let mut best_loss = best_loss_start;
+    let mut best_iter = if iter_start > 0 { iter_start.saturating_sub(1) } else { 0 };
 
-    for iter in 0..iterations {
+    // In-memory checkpoint buffers — serialized each time, flushed to disk only at
+    // end-of-training or on Ctrl-C. No disk I/O inside the hot training loop.
+    let mut ckpt_buf: Vec<u8> = Vec::new();
+    let mut ckpt_best_buf: Vec<u8> = Vec::new();
+
+    for iter in iter_start..iterations {
         // Generate batch indices (sequential, using our RNG)
         let batch_starts: Vec<usize> = (0..BATCH_SIZE)
             .filter_map(|_| {
@@ -793,18 +1158,23 @@ fn train(
                 let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
                 let mut total_loss = 0.0;
 
+                // Scratch buffers hoisted out of the per-position loop to avoid
+                // allocating vocab_size + N_EMBD floats on every of the 64 positions.
+                let mut probs    = vec![0.0f32; model_ref.vocab_size];
+                let mut d_logits = vec![0.0f32; model_ref.vocab_size];
+                let mut d_x_out  = vec![0.0f32; N_EMBD];
+
                 // Train on ALL positions (not just last) - 64x more training signal!
                 for pos in 0..logits_seq.len() {
                     // Compute loss gradient for this position
-                    let mut probs = vec![0.0; model_ref.vocab_size];
                     softmax_fwd(&logits_seq[pos], model_ref.vocab_size, &mut probs, 1.0);
                     total_loss += cross_entropy_loss(&probs, y_vec[pos]);
 
-                    let mut d_logits = probs;
+                    d_logits.copy_from_slice(&probs);
                     d_logits[y_vec[pos]] -= 1.0;
 
                     // Backward through lm_head
-                    let mut d_x_out = vec![0.0; N_EMBD];
+                    d_x_out.fill(0.0);
                     linear_bwd(
                         &d_logits,
                         &acts[pos].x_out,
@@ -815,7 +1185,7 @@ fn train(
                         &mut local_grads.d_lm_head,
                     );
 
-                    let mut d_x = d_x_out;
+                    let mut d_x = d_x_out.clone(); // 128 floats — cheap
 
                     // Backward through layers (FULL: MLP + Attention)
                     for li in (0..N_LAYER).rev() {
@@ -836,7 +1206,7 @@ fn train(
                             N_EMBD,
                             MLP_DIM,
                             &mut d_h2,
-                            &mut local_grads.d_fc2[li],
+                            &mut local_grads.d_fc2[li * N_EMBD * MLP_DIM .. (li + 1) * N_EMBD * MLP_DIM],
                         );
 
                         let mut d_h1 = vec![0.0; MLP_DIM];
@@ -854,7 +1224,7 @@ fn train(
                             MLP_DIM,
                             N_EMBD,
                             &mut d_xn_mlp,
-                            &mut local_grads.d_fc1[li],
+                            &mut local_grads.d_fc1[li * MLP_DIM * N_EMBD .. (li + 1) * MLP_DIM * N_EMBD],
                         );
 
                         // Add MLP residual gradient
@@ -874,7 +1244,7 @@ fn train(
                             N_EMBD,
                             N_EMBD,
                             &mut d_attn_out,
-                            &mut local_grads.d_wo[li],
+                            &mut local_grads.d_wo[li * N_EMBD * N_EMBD .. (li + 1) * N_EMBD * N_EMBD],
                         );
 
                         // Backward through multi-head attention
@@ -937,7 +1307,7 @@ fn train(
                             N_EMBD,
                             N_EMBD,
                             &mut d_xn_attn_q,
-                            &mut local_grads.d_wq[li],
+                            &mut local_grads.d_wq[li * N_EMBD * N_EMBD .. (li + 1) * N_EMBD * N_EMBD],
                         );
 
                         // For K and V, we only backprop to current position
@@ -952,7 +1322,7 @@ fn train(
                             N_EMBD,
                             N_EMBD,
                             &mut d_xn_attn_k,
-                            &mut local_grads.d_wk[li],
+                            &mut local_grads.d_wk[li * N_EMBD * N_EMBD .. (li + 1) * N_EMBD * N_EMBD],
                         );
 
                         linear_bwd(
@@ -962,7 +1332,7 @@ fn train(
                             N_EMBD,
                             N_EMBD,
                             &mut d_xn_attn_v,
-                            &mut local_grads.d_wv[li],
+                            &mut local_grads.d_wv[li * N_EMBD * N_EMBD .. (li + 1) * N_EMBD * N_EMBD],
                         );
 
                         // Combine gradients from Q, K, V
@@ -997,35 +1367,20 @@ fn train(
         for (grads, loss) in results {
             batch_loss += loss;
 
-            // Accumulate gradients
-            for i in 0..model.d_wte.len() {
-                model.d_wte[i] += grads.d_wte[i];
-            }
-            for i in 0..model.d_wpe.len() {
-                model.d_wpe[i] += grads.d_wpe[i];
-            }
-            for i in 0..model.d_lm_head.len() {
-                model.d_lm_head[i] += grads.d_lm_head[i];
-            }
+            // Accumulate gradients via zip — iterator form lets LLVM auto-vectorize (SIMD)
+            model.d_wte.iter_mut().zip(grads.d_wte.iter()).for_each(|(a, b)| *a += b);
+            model.d_wpe.iter_mut().zip(grads.d_wpe.iter()).for_each(|(a, b)| *a += b);
+            model.d_lm_head.iter_mut().zip(grads.d_lm_head.iter()).for_each(|(a, b)| *a += b);
             for li in 0..N_LAYER {
-                for i in 0..model.layers[li].d_wq.len() {
-                    model.layers[li].d_wq[i] += grads.d_wq[li][i];
-                }
-                for i in 0..model.layers[li].d_wk.len() {
-                    model.layers[li].d_wk[i] += grads.d_wk[li][i];
-                }
-                for i in 0..model.layers[li].d_wv.len() {
-                    model.layers[li].d_wv[i] += grads.d_wv[li][i];
-                }
-                for i in 0..model.layers[li].d_wo.len() {
-                    model.layers[li].d_wo[i] += grads.d_wo[li][i];
-                }
-                for i in 0..model.layers[li].d_fc1.len() {
-                    model.layers[li].d_fc1[i] += grads.d_fc1[li][i];
-                }
-                for i in 0..model.layers[li].d_fc2.len() {
-                    model.layers[li].d_fc2[i] += grads.d_fc2[li][i];
-                }
+                let sq = N_EMBD * N_EMBD;
+                let fc1s = MLP_DIM * N_EMBD;
+                let fc2s = N_EMBD * MLP_DIM;
+                model.layers[li].d_wq.iter_mut().zip(grads.d_wq[li*sq..(li+1)*sq].iter()).for_each(|(a, b)| *a += b);
+                model.layers[li].d_wk.iter_mut().zip(grads.d_wk[li*sq..(li+1)*sq].iter()).for_each(|(a, b)| *a += b);
+                model.layers[li].d_wv.iter_mut().zip(grads.d_wv[li*sq..(li+1)*sq].iter()).for_each(|(a, b)| *a += b);
+                model.layers[li].d_wo.iter_mut().zip(grads.d_wo[li*sq..(li+1)*sq].iter()).for_each(|(a, b)| *a += b);
+                model.layers[li].d_fc1.iter_mut().zip(grads.d_fc1[li*fc1s..(li+1)*fc1s].iter()).for_each(|(a, b)| *a += b);
+                model.layers[li].d_fc2.iter_mut().zip(grads.d_fc2[li*fc2s..(li+1)*fc2s].iter()).for_each(|(a, b)| *a += b);
             }
         }
 
@@ -1075,59 +1430,25 @@ fn train(
         );
 
         for li in 0..N_LAYER {
+            // Use raw pointers to avoid the borrow checker requiring .clone() when
+            // param and grad live in the same struct.  Both slices are non-overlapping
+            // fields so this is safe.
             let layer = &mut model.layers[li];
-
-            // Update attention weights
-            adam_step(
-                &mut layer.wq,
-                &layer.d_wq.clone(),
-                &mut layer.m_wq,
-                &mut layer.v_wq,
-                step,
-                lr,
-            );
-            adam_step(
-                &mut layer.wk,
-                &layer.d_wk.clone(),
-                &mut layer.m_wk,
-                &mut layer.v_wk,
-                step,
-                lr,
-            );
-            adam_step(
-                &mut layer.wv,
-                &layer.d_wv.clone(),
-                &mut layer.m_wv,
-                &mut layer.v_wv,
-                step,
-                lr,
-            );
-            adam_step(
-                &mut layer.wo,
-                &layer.d_wo.clone(),
-                &mut layer.m_wo,
-                &mut layer.v_wo,
-                step,
-                lr,
-            );
-
-            // Update MLP weights
-            adam_step(
-                &mut layer.fc1,
-                &layer.d_fc1.clone(),
-                &mut layer.m_fc1,
-                &mut layer.v_fc1,
-                step,
-                lr,
-            );
-            adam_step(
-                &mut layer.fc2,
-                &layer.d_fc2.clone(),
-                &mut layer.m_fc2,
-                &mut layer.v_fc2,
-                step,
-                lr,
-            );
+            macro_rules! layer_adam {
+                ($w:ident, $dw:ident, $mw:ident, $vw:ident) => {{
+                    let grads_ptr = layer.$dw.as_ptr();
+                    let grads_len = layer.$dw.len();
+                    // SAFETY: $w, $dw, $mw, $vw are distinct non-overlapping fields.
+                    let grads: &[f32] = unsafe { std::slice::from_raw_parts(grads_ptr, grads_len) };
+                    adam_step(&mut layer.$w, grads, &mut layer.$mw, &mut layer.$vw, step, lr);
+                }};
+            }
+            layer_adam!(wq, d_wq, m_wq, v_wq);
+            layer_adam!(wk, d_wk, m_wk, v_wk);
+            layer_adam!(wv, d_wv, m_wv, v_wv);
+            layer_adam!(wo, d_wo, m_wo, v_wo);
+            layer_adam!(fc1, d_fc1, m_fc1, v_fc1);
+            layer_adam!(fc2, d_fc2, m_fc2, v_fc2);
         }
 
         // Track best loss
@@ -1136,16 +1457,61 @@ fn train(
             best_iter = iter;
         }
 
-        // Log progress
-        if iter % EVAL_INTERVAL == 0 || iter == iterations - 1 {
+        // Log progress + snapshot checkpoint buffers (in memory, no disk)
+        // Only serialize on the intervals we'd log — keeps the hot path clean.
+        let is_log_iter = iter % EVAL_INTERVAL == 0 || iter == iterations - 1;
+        if is_log_iter {
             println!("Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{}",
                 iter, batch_loss, lr, best_loss, best_iter);
+            ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
+            // Also refresh best buffer if this is the best iter
+            if best_iter == iter {
+                ckpt_best_buf = ckpt_buf.clone();
+            }
+        }
+
+        // Check for Ctrl-C — serialize current state and flush immediately
+        if ctrlc_flag.load(Ordering::Relaxed) {
+            // Serialize now (may not have been done this interval yet)
+            ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
+            if best_iter == iter || ckpt_best_buf.is_empty() {
+                ckpt_best_buf = ckpt_buf.clone();
+            }
+            println!();
+            println!("Interrupted at iteration {}. Saving checkpoint...", iter);
+            if !ckpt_buf.is_empty() {
+                if let Err(e) = flush_checkpoint("checkpoint.bin", &ckpt_buf) {
+                    eprintln!("Warning: could not save checkpoint: {}", e);
+                } else {
+                    println!("✓ Saved checkpoint.bin (iter {})", iter);
+                }
+            }
+            if !ckpt_best_buf.is_empty() {
+                if let Err(e) = flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf) {
+                    eprintln!("Warning: could not save best checkpoint: {}", e);
+                } else {
+                    println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter);
+                }
+            }
+            std::process::exit(0);
         }
     }
 
     println!();
     println!("Training complete!");
     println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
+
+    // Flush final checkpoints to disk
+    if !ckpt_buf.is_empty() {
+        if let Err(e) = flush_checkpoint("checkpoint.bin", &ckpt_buf) {
+            eprintln!("Warning: could not save final checkpoint: {}", e);
+        }
+    }
+    if !ckpt_best_buf.is_empty() {
+        if let Err(e) = flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf) {
+            eprintln!("Warning: could not save best checkpoint: {}", e);
+        }
+    }
 }
 
 /* ------------------------------------------------------------------ */
@@ -1184,13 +1550,22 @@ fn generate(
         (0..N_LAYER).map(|_| Vec::new()).collect();
 
     for _ in tokens.len()..max_len {
-        // Forward pass (training=false, no dropout)
-        let (logits_seq, _) = forward(&tokens, model, &mut kv_cache, false, None);
-        let logits = &logits_seq[logits_seq.len() - 1];
+        // Use Metal-accelerated forward pass if available
+        let logits_seq_metal;
+        let logits_seq_cpu;
+        let logits = if METAL_DEVICE.is_some() {
+            logits_seq_metal = forward_metal_logits(&tokens, model);
+            &logits_seq_metal[logits_seq_metal.len() - 1]
+        } else {
+            let (seq, _) = forward(&tokens, model, &mut kv_cache, false, None);
+            logits_seq_cpu = seq;
+            &logits_seq_cpu[logits_seq_cpu.len() - 1]
+        };
+        let logits = logits.clone();
 
         // Sample next token with top-p
         let mut probs = vec![0.0; model.vocab_size];
-        softmax_fwd(logits, model.vocab_size, &mut probs, temperature);
+        softmax_fwd(&logits, model.vocab_size, &mut probs, temperature);
 
         // Top-p sampling
         let mut sorted_indices: Vec<usize> = (0..model.vocab_size).collect();
@@ -1261,11 +1636,15 @@ fn estimate_loss(
         let x = &data[start_idx..start_idx + BLOCK_SIZE];
         let y = &data[start_idx + 1..start_idx + BLOCK_SIZE + 1];
 
-        let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
-            (0..N_LAYER).map(|_| Vec::new()).collect();
-
-        // Evaluation mode (training=false, no dropout)
-        let (logits_seq, _) = forward(x, model, &mut kv_cache, false, None);
+        // Use Metal-accelerated forward pass if available
+        let logits_seq = if METAL_DEVICE.is_some() {
+            forward_metal_logits(x, model)
+        } else {
+            let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
+                (0..N_LAYER).map(|_| Vec::new()).collect();
+            let (logits, _) = forward(x, model, &mut kv_cache, false, None);
+            logits
+        };
 
         for (logits, &target) in logits_seq.iter().zip(y.iter()) {
             let mut probs = vec![0.0; model.vocab_size];
@@ -1287,16 +1666,51 @@ fn estimate_loss(
 /* ------------------------------------------------------------------ */
 fn main() -> std::io::Result<()> {
     // Parse command-line arguments
+    // Usage: randygpt [--iters N] [--resume [path]]
+    //   --iters N         total iterations to train (default: MAX_ITERS)
+    //   --resume          resume from checkpoint.bin (auto-detected)
+    //   --resume <path>   resume from a specific checkpoint file
     let args: Vec<String> = std::env::args().collect();
 
-    let iterations = if args.len() > 1 {
-        args[1].parse::<usize>().unwrap_or_else(|_| {
-            eprintln!("Invalid iterations argument. Using default: {}", MAX_ITERS);
-            MAX_ITERS
-        })
-    } else {
-        MAX_ITERS
-    };
+    let mut iterations = MAX_ITERS;
+    let mut resume_path: Option<String> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--iters" => {
+                i += 1;
+                if i < args.len() {
+                    iterations = args[i].parse::<usize>().unwrap_or_else(|_| {
+                        eprintln!("Invalid --iters value. Using default: {}", MAX_ITERS);
+                        MAX_ITERS
+                    });
+                }
+            }
+            "--resume" => {
+                // Optional path follows; if next arg starts with '-' or is absent, use default
+                if i + 1 < args.len() && !args[i + 1].starts_with('-') {
+                    i += 1;
+                    resume_path = Some(args[i].clone());
+                } else {
+                    resume_path = Some("checkpoint.bin".to_string());
+                }
+            }
+            other => {
+                // Legacy: bare number as first arg = iterations
+                if let Ok(n) = other.parse::<usize>() {
+                    iterations = n;
+                } else {
+                    eprintln!("Unknown argument '{}'. Ignoring.", other);
+                }
+            }
+        }
+        i += 1;
+    }
+
+    // Auto-detect checkpoint if --resume not given but checkpoint.bin exists
+    if resume_path.is_none() && Path::new("checkpoint.bin").exists() {
+        eprintln!("Found checkpoint.bin — use --resume to continue from it, or delete it to start fresh.");
+    }
 
     println!("=== Enhanced randyGPT ===");
     println!("Model: {} layers, {} heads, {} embedding dim", N_LAYER, N_HEAD, N_EMBD);
@@ -1334,7 +1748,7 @@ fn main() -> std::io::Result<()> {
     let data = tokenizer.encode(&training_text);
     println!("Tokenized to {} tokens", data.len());
 
-    // Initialize model
+    // Initialize model (always start fresh, then overwrite with checkpoint if resuming)
     println!("Initializing model...");
     let mut model = GPTModel::new(tokenizer.vocab_size, &mut rng);
 
@@ -1350,14 +1764,48 @@ fn main() -> std::io::Result<()> {
     println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
     println!();
 
+    // Load checkpoint if resuming
+    let (iter_start, step_start, best_loss_start) = if let Some(ref ckpt) = resume_path {
+        match load_checkpoint(ckpt, &mut model) {
+            Ok((it, st, bl)) => {
+                println!("✓ Resumed from '{}' — iter {}, step {}, best loss {:.4}", ckpt, it, st, bl);
+                println!();
+                (it, st, bl)
+            }
+            Err(e) => {
+                eprintln!("Error loading checkpoint '{}': {}", ckpt, e);
+                eprintln!("Starting from scratch instead.");
+                (0, 0, f32::INFINITY)
+            }
+        }
+    } else {
+        (0, 0, f32::INFINITY)
+    };
+
+    // Guard: nothing to do if already at or past target
+    if iter_start >= iterations {
+        println!("Already at iteration {} (target {}). Nothing to train.", iter_start, iterations);
+        println!("Increase --iters to continue training.");
+        return Ok(());
+    }
+
     // Estimate initial loss
     println!("Estimating initial loss...");
     let initial_loss = estimate_loss(&model, &data, 10, &mut rng);
     println!("Initial loss: {:.4}", initial_loss);
     println!();
 
+    // Install Ctrl-C handler — sets a flag; train() checks it each iteration and flushes cleanly
+    let ctrlc_flag = Arc::new(AtomicBool::new(false));
+    {
+        let flag = ctrlc_flag.clone();
+        ctrlc::set_handler(move || {
+            flag.store(true, Ordering::Relaxed);
+        }).expect("Error setting Ctrl-C handler");
+    }
+
     // Train the model
-    train(&mut model, &data, iterations, &mut rng);
+    train(&mut model, &data, iterations, &mut rng, iter_start, step_start, best_loss_start, ctrlc_flag);
 
     // Estimate loss after training
     println!("Estimating final loss...");

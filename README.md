@@ -1,163 +1,155 @@
-# randyGPT - Enhanced Mini GPT in Rust
+# randyGPT - Mini GPT in Rust
 
-A minimal GPT-style language model implemented from scratch in Rust, with enhanced architecture and training data support.
+A GPT-style language model implemented from scratch in Rust. No external ML frameworks for training — pure Rust with Rayon for parallelism and Candle/Metal for accelerated inference on Apple Silicon.
 
 ## Features
 
-- **Transformer Architecture**: Multi-head attention, feed-forward layers, residual connections
-- **✨ Multi-Core Training**: Rayon parallelization for 8x speedup
-- **✨ Working Training Loop**: Adam optimizer with backward pass
-- **Configurable Model Size**: Easily adjust embedding dimensions, layers, and heads
-- **Character-Level Tokenization**: Simple but effective tokenization with BOS/EOS tokens
-- **Top-P Sampling**: Nucleus sampling for text generation
-- **Training Data Support**: Load text files for training
-- **RMSNorm**: Efficient normalization technique
-- **KV Cache**: Efficient inference with key-value caching
+- **Transformer Architecture**: Multi-head attention, feed-forward layers, residual connections, RMSNorm
+- **Multi-Core Training**: Rayon parallelization across all CPU cores
+- **Full Training Loop**: Backward pass, AdamW optimizer, gradient clipping, dropout
+- **GPT-2 Style Init**: Scaled output projections for stable deep training
+- **LR Schedule**: Linear warmup → constant → cosine decay
+- **Metal GPU Inference**: Batched matmuls via Candle on Apple M-series chips (inference/eval only)
+- **Checkpoint Save/Resume**: Save and continue training across sessions
+- **Character-Level Tokenization**: With BOS/EOS tokens, up to 512-char vocabulary
+- **KV Cache**: Efficient autoregressive generation
+- **Top-P + Temperature Sampling**: Nucleus sampling for text generation
 
-## Model Configuration
+## Current Model Configuration (v0.5)
 
-### Current (Enhanced) Settings
-- Embedding dimension: 128 (was 32)
-- Attention heads: 8 (was 4)
-- Layers: 4 (was 1)
-- Block size: 64 (was 8)
-- MLP hidden dimension: 512
-- Max vocabulary: 512 characters
-
-### Original (Mini) Settings
-```rust
-const N_EMBD: usize = 32;
-const N_HEAD: usize = 4;
-const N_LAYER: usize = 1;
-const BLOCK_SIZE: usize = 8;
-```
-
-## Key Improvements Over Original
-
-1. **Larger Architecture**: 4 layers vs 1, 128-dim vs 32-dim embeddings
-2. **✨ Multi-Core Training**: Rayon for 8x speedup on multi-core CPUs
-3. **✨ Working Training**: Backward pass + Adam optimizer implemented
-4. **Better Tokenizer**: Proper character-level with BOS/EOS tokens
-5. **Data Loading**: Can load training text from files
-6. **Cleaner Code**: Better organization with proper model structure
-7. **KV Caching**: Efficient inference with cached keys and values
-
-## Performance
-
-- **Training Speed**: ~78 seconds for 1000 iterations (Shakespeare dataset)
-- **CPU Usage**: 825% (uses 8+ cores efficiently with Rayon)
-- **Speedup**: 8x faster than single-core
-- **Loss Improvement**: 5.88 → 3.23 (45% reduction)
-- **Parameters**: ~800K
+| Hyperparameter | Value |
+|----------------|-------|
+| Embedding dim | 128 |
+| Attention heads | 8 |
+| Layers | 6 |
+| Block size | 64 tokens |
+| MLP hidden dim | 512 (4× embd) |
+| Parameters | ~1.20M |
+| Dropout | 0.1 |
+| Optimizer | AdamW (wd=0.01) |
 
 ## Usage
 
-### Build and Run
+### Build
 
 ```bash
-cargo run --release
+cargo build --release
 ```
 
-### Training Data
+Requires Rust nightly (for Candle Metal support):
+```bash
+rustup default nightly
+```
+
+### Train from scratch
+
+```bash
+./target/release/randygpt --iters 1000
+```
+
+### Resume training from a checkpoint
+
+```bash
+# Resume from the last periodic checkpoint (auto path)
+./target/release/randygpt --iters 2000 --resume
+
+# Resume from the best-loss checkpoint
+./target/release/randygpt --iters 2000 --resume checkpoint_best.bin
+
+# Resume from a specific checkpoint file
+./target/release/randygpt --iters 5000 --resume my_run.bin
+```
+
+### Checkpoint files
+
+State is serialized to memory every iteration and flushed to disk only when training finishes or you press **Ctrl-C** — zero disk I/O in the hot loop, so CPU stays at full multi-core.
+
+| File | Flushed when |
+|------|-------------|
+| `checkpoint.bin` | Training completes or Ctrl-C |
+| `checkpoint_best.bin` | Training completes or Ctrl-C (if loss improved) |
+
+Both files include model weights **and** full AdamW optimizer state, so the LR schedule resumes correctly from exactly where you left off.
+
+Checkpoint size: ~14 MB for the current 1.2M-param config.
+
+### Training data
 
 Place your training text in `train.txt`:
 
 ```bash
-echo "Your training text here..." > train.txt
+# Shakespeare (classic benchmark)
+curl -o train.txt https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
+
+# Or any plain text
+cp my_text.txt train.txt
 ```
 
-The model will automatically load this file. If no `train.txt` exists, it uses default sample data.
-
-### Generate Text
-
-The model initializes and generates sample text automatically. Edit the `main()` function to customize:
-
-```rust
-let sample = generate(
-    &model,
-    &tokenizer,
-    "Your prompt here",  // Input prompt
-    100,                 // Max new tokens
-    0.8,                 // Temperature
-    0.9,                 // Top-p value
-    &mut rng,
-);
-```
+If `train.txt` is absent, the model falls back to a tiny built-in sample.
 
 ## Architecture Details
 
 ### Forward Pass
 
-1. **Token + Position Embedding**: Combine token and positional embeddings
-2. **Transformer Layers** (repeated N_LAYER times):
-   - RMSNorm
-   - Multi-head self-attention with causal masking
-   - Residual connection
-   - RMSNorm
-   - MLP with squared ReLU activation
-   - Residual connection
-3. **Final Projection**: Project to vocabulary size
+1. **Token + Position Embedding** — learned lookup tables
+2. **Transformer Layers** (×N_LAYER):
+   - RMSNorm → Multi-head causal self-attention → Residual
+   - RMSNorm → MLP (squared ReLU, 4× expansion) → Residual
+   - Dropout after attention projection and MLP output (training only)
+3. **LM Head** — linear projection to vocab logits
 
-### Attention Mechanism
+### Training
 
-- Scaled dot-product attention
-- Causal masking (can only attend to previous tokens)
-- Multi-head with separate Q, K, V projections per head
+- **Loss**: Cross-entropy over all sequence positions (not just last token)
+- **Backward**: MLP and embedding gradients; attention handled via simplified path
+- **Optimizer**: AdamW — Adam with decoupled weight decay (β₁=0.9, β₂=0.999, wd=0.01)
+- **Gradient clipping**: L∞ norm clipped at 1.0
+- **Parallelism**: Rayon processes each batch item on a separate thread; gradients summed after
 
-### MLP Block
+### Metal GPU Acceleration
 
-- Expand to `4 * N_EMBD` dimensions
-- Squared ReLU activation (ReLU(x)²)
-- Project back to `N_EMBD` dimensions
+On Apple Silicon Macs, Metal is used for batched matrix multiplications during inference and loss estimation. Training stays on CPU (the backward pass is CPU-only, and Rayon's parallelism already uses all cores effectively).
 
-## TODO / Future Improvements
+The benchmark for the current config:
+- CPU QKV [64×128]*[128×128]: ~0.6ms
+- Metal QKV: <0.01ms (>100× faster for batched ops)
 
-- [x] ~~Implement backward pass for training~~ ✅ Done (v0.3.0)
-- [x] ~~Add Adam optimizer~~ ✅ Done (v0.3.0)
-- [x] ~~Multi-core training~~ ✅ Done with Rayon (v0.3.0)
-- [ ] Attention gradient computation (currently simplified)
-- [ ] Gradient clipping
-- [ ] Learning rate scheduling
-- [ ] Model checkpointing (save/load weights)
-- [ ] Better tokenization (BPE)
-- [ ] Mixed precision training
-- [ ] Validation split and perplexity metrics
-- [ ] CLI arguments for hyperparameters
-- [ ] GPU support (wgpu/CUDA)
+## Performance
 
-## Training (Working!)
+- **Training speed**: ~45s per 100 iterations (Shakespeare, 1.1M tokens, 12 cores)
+- **CPU usage**: ~350% (3–4 cores effectively via Rayon at current batch/model size)
+- **Memory**: ~420 MB RSS (stable, no growth)
 
-Training is now fully functional:
-1. ✅ Backward pass through MLP layers
-2. ✅ Gradient accumulation across batches
-3. ✅ Adam optimizer with momentum
-4. ✅ Multi-core parallelization with Rayon
-5. ✅ Loss tracking and logging
-
-Run `cargo run --release` and watch it learn!
-
-## Parameter Scaling
-
-For reference, approximate parameter counts at different scales:
+## Parameter Scaling Reference
 
 | Config | Layers | Dim | Heads | Params |
 |--------|--------|-----|-------|--------|
-| Tiny (original) | 1 | 32 | 4 | ~10K |
-| Small (current) | 4 | 128 | 8 | ~400K |
-| Medium | 6 | 256 | 8 | ~3M |
-| Large | 12 | 512 | 16 | ~20M |
+| Tiny | 2 | 64 | 4 | ~80K |
+| Current | 6 | 128 | 8 | ~1.2M |
+| Medium | 6 | 256 | 8 | ~4.8M |
+| Large | 12 | 512 | 16 | ~40M |
 
-## Performance Notes
+## TODO / Future Improvements
 
-- Runs on CPU (no GPU acceleration)
-- Generation is autoregressive (one token at a time)
-- Larger models require more memory and compute
-- Release builds are significantly faster than debug builds
+- [x] ~~Implement backward pass for training~~ ✅ (v0.2)
+- [x] ~~Add Adam optimizer~~ ✅ (v0.2)
+- [x] ~~Multi-core training~~ ✅ Rayon (v0.3)
+- [x] ~~Gradient clipping~~ ✅ (v0.4)
+- [x] ~~Learning rate scheduling~~ ✅ (v0.4)
+- [x] ~~Dropout~~ ✅ (v0.4)
+- [x] ~~GPT-2 style initialization~~ ✅ (v0.4)
+- [x] ~~CLI arguments~~ ✅ (v0.4)
+- [x] ~~Model checkpointing (save/load weights)~~ ✅ (v0.5)
+- [x] ~~Metal/GPU inference acceleration~~ ✅ Candle (v0.5)
+- [ ] Full attention gradient computation
+- [ ] Validation split and perplexity metrics
+- [ ] BPE tokenization
+- [ ] Mixed precision training
 
 ## Credits
 
-Based on mini_gpt.rs by RandyMcMillan
-Enhanced with proper architecture and training infrastructure
+Based on mini_gpt.rs by @RandyMcMillan
+Enhanced by Claude Sonnet 4.5 / Monumental Systems
 
 ## License
 
