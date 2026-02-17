@@ -3,6 +3,7 @@
 /* ------------------------------------------------------------------ */
 
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::time::Instant;
 use rayon::prelude::*;
 
 use crate::checkpoint::{flush_checkpoint, serialize_checkpoint};
@@ -153,7 +154,12 @@ pub fn train(
     let mut ckpt_buf:      Vec<u8> = Vec::new();
     let mut ckpt_best_buf: Vec<u8> = Vec::new();
 
+    let train_start  = Instant::now();
+    let mut iter_count = 0u64;       // iterations actually executed this session
+    let mut total_iter_ms = 0u64;    // cumulative wall time for those iterations
+
     for iter in iter_start..iterations {
+        let iter_start_time = Instant::now();
         // Sample batch indices
         let batch_starts: Vec<usize> = (0..BATCH_SIZE)
             .filter_map(|_| {
@@ -414,20 +420,27 @@ pub fn train(
             best_iter = iter;
         }
 
+        iter_count    += 1;
+        total_iter_ms += iter_start_time.elapsed().as_millis() as u64;
+
         // Log + snapshot checkpoint buffers
         let is_log_iter = iter % EVAL_INTERVAL == 0 || iter == iterations - 1;
         if is_log_iter {
+            let elapsed   = train_start.elapsed().as_secs_f32();
+            let avg_ms    = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+            let elapsed_s = format!("{:.0}s", elapsed);
+
             if !val_data.is_empty() {
                 let val_loss = estimate_loss(model, val_data, 10, rng);
                 let val_ppl  = val_loss.exp();
                 println!(
-                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{}",
-                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {:.0}ms/iter | {}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, avg_ms, elapsed_s
                 );
             } else {
                 println!(
-                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{}",
-                    iter, batch_loss, lr, best_loss, best_iter
+                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{} | {:.0}ms/iter | {}",
+                    iter, batch_loss, lr, best_loss, best_iter, avg_ms, elapsed_s
                 );
             }
             ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
@@ -440,8 +453,11 @@ pub fn train(
             if best_iter == iter || ckpt_best_buf.is_empty() {
                 ckpt_best_buf = ckpt_buf.clone();
             }
+            let elapsed   = train_start.elapsed().as_secs_f32();
+            let avg_ms    = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
             println!();
             println!("Interrupted at iteration {}. Saving checkpoint...", iter);
+            println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
             flush_checkpoint("checkpoint.bin", &ckpt_buf)
                 .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
@@ -452,8 +468,12 @@ pub fn train(
         }
     }
 
+    let total_elapsed = train_start.elapsed().as_secs_f32();
+    let avg_ms = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
+
     println!();
     println!("Training complete!");
+    println!("Total time:  {:.1}s | Avg: {:.0}ms/iter ({} iters)", total_elapsed, avg_ms, iter_count);
     println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
 
     if !ckpt_buf.is_empty() {
