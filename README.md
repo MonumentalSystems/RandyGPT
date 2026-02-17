@@ -141,8 +141,9 @@ The benchmark for the current config:
 - [x] ~~CLI arguments~~ ✅ (v0.4)
 - [x] ~~Model checkpointing (save/load weights)~~ ✅ (v0.5)
 - [x] ~~Metal/GPU inference acceleration~~ ✅ Candle (v0.5)
-- [ ] Full attention gradient computation
-- [ ] Validation split and perplexity metrics
+- [x] ~~Full attention gradient computation~~ ✅ (v0.6.0)
+- [x] ~~Validation split and perplexity metrics~~ ✅ (v0.6.0)
+- [ ] BLAS integration for CPU matmuls
 - [ ] BPE tokenization
 - [ ] Mixed precision training
 
