@@ -185,7 +185,7 @@ The `.bin` file is corrupt or not a randyGPT checkpoint. Use a different file or
 The checkpoint was saved with a different training corpus (different character set → different vocab). Either use the same `train.txt` or delete the checkpoint and start fresh.
 
 ### Out of memory
-Reduce `N_EMBD`, `N_LAYER`, or `BLOCK_SIZE` in `src/main.rs` and rebuild.
+Reduce `N_EMBD`, `N_LAYER`, or `BLOCK_SIZE` in `src/config.rs` and rebuild.
 
 ### Very slow training
 - Confirm you're using `--release`
