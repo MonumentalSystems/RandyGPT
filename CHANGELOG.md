@@ -20,17 +20,52 @@ All notable changes to randyGPT are documented here.
 | **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
 | **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** |
 | **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 128 |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 |
 | **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
 | **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules | 10 modules |
 | **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~400MB real† | ~400MB real† |
-| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ | TBD |
+| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** |
+| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ | ~32min** |
 
 †RSS ~400MB real; Activity Monitor shows ~3GB (Metal unified memory in virtual space — not CPU-resident)
 ‡Estimated
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
+\*\*BLOCK_SIZE=256, BATCH_SIZE=64; ~1912ms/iter; val ppl 11.8 @iter 500 still improving (T=64 was 12.4 and degrading at iter 500)
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+
+---
+
+## [0.9.0] - 2026-02-16
+
+### 4× Context Window (BLOCK_SIZE 64 → 256)
+
+#### Architecture Change
+- `BLOCK_SIZE: 64 → 256` — model now sees ~4 full lines of Shakespeare per training sample
+- `BATCH_SIZE: 128 → 64` — halved to keep Metal activation tape (`[B, T, D]`) memory-stable at 4× context
+- Token throughput per iter unchanged: 128×64 = 64×256 = 8,192 tokens/batch
+- Parameters: ~4.77M → **~4.82M** (wpe table grows: 192 × N_EMBD extra floats)
+
+#### Why This Helps
+- At T=64 the model saw ~1 line of text per sample — enough for character n-gram statistics, not enough for verse structure
+- At T=256 each sample spans a full speech: speaker cues, line breaks, iambic rhythm, multi-sentence flow
+- Attention heads can now attend across 256 positions — rhyme schemes, callback words, dialogue turns all fit in one window
+
+#### Measured Results vs T=64 Baseline (500 iters, Shakespeare)
+| iter | T=64 val ppl | T=256 val ppl |
+|------|-------------|--------------|
+| 200 | 12.3 | 13.4 |
+| 300 | 11.8 | 12.0 |
+| 400 | 11.2 | 11.2 ← tied |
+| 500 | 12.4 ← degrading | **11.8 ← still improving** |
+
+- T=64 overfit and reversed after iter 400; T=256 had tight train/val gap and continued improving
+- Speed: ~1912ms/iter (vs ~434ms at T=64) — attention O(T²) accounts for most of the increase
+- Memory: ~200MB real RSS, ~8GB virtual (Metal unified memory, unchanged pattern)
+
+#### Fix: Initial Loss Estimate on Resume
+- Previously `--resume` showed initial loss ~4.20 (freshly-initialized CPU model) instead of resumed checkpoint loss
+- Fixed: sync `CandleModel` weights back to CPU `GPTModel` before `estimate_loss` when resuming on Metal
 
 ---
 
