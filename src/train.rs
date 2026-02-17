@@ -627,7 +627,7 @@ pub fn train_candle(
     println!("=== Starting Training (Metal GPU via Candle) ===");
     if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
     println!("Iterations: {} → {}", iter_start, iterations);
-    println!("Batch size: {}", BATCH_SIZE);
+    println!("Batch size: {} × {} accum steps = {} effective", BATCH_SIZE, GRAD_ACCUM_STEPS, BATCH_SIZE * GRAD_ACCUM_STEPS);
     println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
     println!();
 
@@ -649,33 +649,55 @@ pub fn train_candle(
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
 
-        // ── Sample batch ──────────────────────────────────────────────
-        let mut tok_data:  Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
-        let mut tgt_data:  Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
-        for _ in 0..BATCH_SIZE {
-            if data.len() <= BLOCK_SIZE + 1 { continue; }
-            let start = rng.choice(data.len() - BLOCK_SIZE - 1);
-            for t in 0..BLOCK_SIZE {
-                tok_data.push(data[start + t] as u32);
-                tgt_data.push(data[start + t + 1] as u32);
+        // ── Gradient accumulation loop ────────────────────────────────
+        // Run GRAD_ACCUM_STEPS micro-batches, sum their losses, then do
+        // one backward + optimizer step. Effective batch = BATCH_SIZE × GRAD_ACCUM_STEPS.
+        let mut accum_loss: Option<Tensor> = None;
+        let mut batch_loss_sum = 0.0f32;
+        let mut accum_count = 0usize;
+
+        for _ in 0..GRAD_ACCUM_STEPS {
+            let mut tok_data: Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
+            let mut tgt_data: Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
+            for _ in 0..BATCH_SIZE {
+                if data.len() <= BLOCK_SIZE + 1 { continue; }
+                let start = rng.choice(data.len() - BLOCK_SIZE - 1);
+                for t in 0..BLOCK_SIZE {
+                    tok_data.push(data[start + t] as u32);
+                    tgt_data.push(data[start + t + 1] as u32);
+                }
             }
+            let actual_batch = tok_data.len() / BLOCK_SIZE;
+            if actual_batch == 0 { continue; }
+
+            let tokens  = Tensor::from_vec(tok_data, (actual_batch, BLOCK_SIZE), &device)
+                .unwrap_or_else(|e| panic!("token tensor: {}", e));
+            let targets = Tensor::from_vec(tgt_data, (actual_batch, BLOCK_SIZE), &device)
+                .unwrap_or_else(|e| panic!("target tensor: {}", e));
+
+            let loss = forward_candle_train(&tokens, &targets, model, true)
+                .unwrap_or_else(|e| panic!("forward: {}", e));
+
+            batch_loss_sum += loss.to_scalar::<f32>()
+                .unwrap_or_else(|e| panic!("loss scalar: {}", e));
+            accum_count += 1;
+
+            // Accumulate into sum — backward on the mean across micro-batches
+            accum_loss = Some(match accum_loss {
+                None       => loss,
+                Some(prev) => (prev + loss).unwrap_or_else(|e| panic!("loss add: {}", e)),
+            });
         }
-        let actual_batch = tok_data.len() / BLOCK_SIZE;
-        if actual_batch == 0 { continue; }
 
-        let tokens  = Tensor::from_vec(tok_data, (actual_batch, BLOCK_SIZE), &device)
-            .unwrap_or_else(|e| panic!("token tensor: {}", e));
-        let targets = Tensor::from_vec(tgt_data, (actual_batch, BLOCK_SIZE), &device)
-            .unwrap_or_else(|e| panic!("target tensor: {}", e));
+        if accum_count == 0 { continue; }
+        let batch_loss = batch_loss_sum / accum_count as f32;
 
-        // ── Forward + backward ────────────────────────────────────────
-        let loss_tensor = forward_candle_train(&tokens, &targets, model, true)
-            .unwrap_or_else(|e| panic!("forward: {}", e));
-        let batch_loss: f32 = loss_tensor.to_scalar::<f32>()
-            .unwrap_or_else(|e| panic!("loss scalar: {}", e));
+        // Divide accumulated loss by step count so gradients are mean-scaled
+        let mean_loss = (accum_loss.unwrap() * (1.0 / accum_count as f64))
+            .unwrap_or_else(|e| panic!("loss scale: {}", e));
 
-        // backward() returns GradStore; grads.get(&var) retrieves each gradient
-        let grads = loss_tensor.backward()
+        // ── Single backward + optimizer step ──────────────────────────
+        let grads = mean_loss.backward()
             .unwrap_or_else(|e| panic!("backward: {}", e));
 
         step += 1;
