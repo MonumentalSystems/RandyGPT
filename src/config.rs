@@ -45,7 +45,11 @@ pub const N_LAYER: usize = 6;
 pub const BLOCK_SIZE: usize = 256;
 pub const HEAD_DIM:   usize = N_EMBD / N_HEAD;
 pub const MLP_DIM:    usize = 4 * N_EMBD;
-pub const MAX_VOCAB:  usize = 512;
+pub const MAX_VOCAB:  usize = 8192;   // raised for BPE (char-level uses ~117)
+
+// ── BPE tokenizer ─────────────────────────────────────────────────────────
+pub const BPE_VOCAB_SIZE: usize = 2000; // default target vocab for --bpe mode
+pub const BPE_VOCAB_PATH: &str  = "vocab.json";
 
 // ── Training ──────────────────────────────────────────────────────────────
 

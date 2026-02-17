@@ -4,33 +4,67 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 |
-|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** |
-| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 |
-| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** |
-| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** |
-| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 | v0.9.2 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M | ~4.82M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** | same |
+| **Tokenizer** | char | char | char | char | char | char | char | char | char | char | char | **char + BPE** |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** | ✅ RGPT0003 |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** | ✅ val-based |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 |
+| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** |
+| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | TBD (BPE) |
+| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 |
 
 †RSS ~1GB real at T=256; Activity Monitor shows 4-8GB (Metal unified memory pool — not CPU-resident)
 ‡Estimated
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+
+---
+
+## [0.9.2] - 2026-02-17
+
+### BPE Tokenization (`--bpe` flag)
+
+#### Implementation
+- Added `BpeTokenizer` to `src/tokenizer.rs` alongside existing char-level tokenizer — same public interface (`encode`, `decode`, `vocab_size`), zero changes to training loop, model, or checkpoint format
+- BPE training: incremental pair-counting with max-heap (lazy deletion) — O(n + merges × log n) vs naive O(n × merges²). Trains 2000-token vocab on 7.6MB corpus in ~15 seconds
+- BPE encoding: one pass per merge priority level, applied to parallel line-chunks via rayon — full 7.6MB corpus encodes in seconds vs minutes for naive approach
+- Vocab saved to `vocab.json` (serde_json) on first run, loaded automatically on resume — no retraining needed
+- `--bpe [N]` CLI flag: `--bpe` uses default 2000-token vocab, `--bpe 3000` uses custom size
+- Char-level checkpoints incompatible with BPE checkpoints — caught cleanly by existing `vocab_size` mismatch check in `checkpoint.rs`
+- Added `serde` + `serde_json` dependencies for vocab persistence
+
+#### Usage
+```bash
+# First run — trains BPE vocab, saves vocab.json, trains model
+./randygpt --bpe --iters 3000
+
+# Resume — loads vocab.json automatically
+./randygpt --bpe --resume --iters 3000
+
+# Custom vocab size
+./randygpt --bpe 3000 --iters 3000
+```
+
+#### Early BPE Results (model-L, 2000 tokens, in progress)
+- Initial ppl ~2000 (full vocab entropy: log(2000) ≈ 7.6 nats) — expected for fresh init
+- iter 100: ppl 663, iter 200: ppl 416, iter 250: ppl 318 — steep descent, patience resetting every eval
+- Generation at iter 100 already shows real Shakespeare words ("hath", "father", "speak", "friend") vs char-level noise at same iter count
+- Speed: ~1870ms/iter (same as char-level — wte/lm_head are larger but GPU-bound compute unchanged)
+- Full results TBD when 3000-iter run completes
 
 ---
 
@@ -66,6 +100,39 @@ All notable changes to randyGPT are documented here.
 - T=256 context window outperforms T=64 peak (ppl 10.8): model sees full Shakespeare speeches per sample
 - Val floor ~2.37 is the data ceiling for 5M params on ~1MB Shakespeare corpus
 - Further improvement requires more data or a larger model (v1.0 roadmap)
+
+#### Model Size Scaling Experiment (model-S, 7.6MB corpus)
+- Built `--features model-s` binary (128-dim, 4-head, 4-layer, ~0.85M params) and trained from scratch on the 7.6MB expanded corpus
+- Result: best val loss **2.4918 (ppl 12.1)**, final val **2.5316 (ppl 12.6)** at iter 2000, 592ms/iter
+- Comparison: model-L (4.82M) + 1MB = ppl **10.6** vs model-S (0.85M) + 7.6MB = ppl **12.1**
+- **Conclusion: model capacity is the binding constraint** — 7× more data does not compensate for 5.7× fewer parameters at this scale. Expanding the corpus pays off only when paired with a model large enough to use it.
+
+#### Model-L + 7.6MB Experiment
+- Same model-L architecture (4.82M params) that achieved ppl 10.6 on 1MB, now trained on 7.6MB corpus
+- Result: best val loss **2.4474 (ppl 11.6)** at iter ~850, early stopping fired at iter 1050 (patience 20/20)
+- Resumed from best checkpoint at lr 1e-5; best improved to **2.4474 (ppl 11.6)** — did not beat 10.6 baseline
+- **Finding:** more data alone did not help model-L — the model plateaued at ppl 11.6 with 7.6MB vs 10.6 with 1MB
+- Root cause: 7.6MB corpus has more stylistic diversity (sonnets + 8 plays) than the focused 1MB corpus; char-level model capacity is the bottleneck, not data volume at this architecture
+- **Conclusion: char-level tokenization is the fundamental ceiling** — model needs to learn to spell before learning style. BPE tokenization is the right next step.
+
+#### Model Size Scaling Experiment (model-M, 7.6MB corpus)
+- Built `--features model-m` binary (192-dim, 6-head, 6-layer, ~2.75M params) and trained on the 7.6MB expanded corpus
+- Run was fragmented across multiple `--iters` segments (500 → 1000) due to interactive testing; total ~1000 iters trained
+- Result at iter 1000: best val loss **2.4993 (ppl 12.5)**, speed ~1370ms/iter
+- Descent trajectory: ppl 116.9 @ iter 0 → 30.9 @ iter 100 → 15.2 @ iter 270 → 13.5 @ iter 400 → **12.5 @ iter 1000**
+- Model-M is clearly stronger than model-S early (ppl 30.9 vs ~65 at iter 100) but didn't reach ppl 10.6 in 1000 iters
+- **Note:** fragmented LR schedule (each `--iters N` restart re-anchors cosine decay) meant the model never got a full 1800-iter flat LR phase; true potential likely higher
+- Generation at ppl 12.5 shows more word-like fragments than model-S ("have my insure that", "the meldo cout") but still char-level noise
+- Next: model-L (4.82M) + 7.6MB — same architecture as the ppl 10.6 baseline, now with 7× more data
+
+| Metric | model-S + 7.6MB | model-M + 7.6MB | model-L + 1MB (baseline) |
+|--------|----------------|----------------|--------------------------|
+| Params | ~0.85M | ~2.75M | ~4.82M |
+| Best ppl | 12.1 | 12.5* | **10.6** |
+| Iters | 2000 | ~1000 (fragmented) | ~929 |
+| ms/iter | 592 | 1370 | 1835 |
+
+*fragmented LR schedule — not a fair comparison to a clean full run
 
 ---
 
@@ -526,10 +593,13 @@ Cores used: 12 available, ~8 effectively utilized
 - [x] `--lr` / `--min-lr` CLI flags for runtime LR override
 - [x] Confirmed best: val ppl **10.6** (2.3716 loss) at T=256
 
-### v1.0.0 - More Data / Bigger Model
-- [ ] Multiple model size presets via CLI (S/M/L)
-- [ ] Larger training corpus (more than 1MB Shakespeare)
-- [ ] BPE tokenization
+### v1.0.0 - BPE Tokenization + Quality Breakthrough
+- [x] Multiple model size presets (S/M/L/XL) via `--features` at build time
+- [x] Larger training corpus: 7.6MB (8× Shakespeare works from Project Gutenberg)
+- [x] **model-M (2.7M) + 7.6MB** — tested (ppl 12.5 at iter 1000, fragmented schedule)
+- [x] **model-L (4.82M) + 7.6MB** — char-level ceiling confirmed at ppl 11.6; more data alone insufficient
+- [x] **BPE tokenization** — `--bpe [N]` flag, 2000-token vocab, heap-based training ~15s, parallel encoding
+- [ ] **BPE 3000-iter run to completion** — target: first coherent multi-word Shakespeare phrases ← **running now**
 - [ ] Mixed precision (f16) training on Metal
 
 ---

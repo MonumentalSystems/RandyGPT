@@ -42,6 +42,7 @@ fn main() -> std::io::Result<()> {
     let mut resume_path: Option<String> = None;
     let mut lr_override:     Option<f32> = None;
     let mut min_lr_override: Option<f32> = None;
+    let mut bpe_vocab_size:  Option<usize> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -69,6 +70,16 @@ fn main() -> std::io::Result<()> {
                 i += 1;
                 if i < args.len() {
                     min_lr_override = args[i].parse().ok();
+                }
+            }
+            "--bpe" => {
+                // --bpe        → use default BPE_VOCAB_SIZE
+                // --bpe 3000   → use custom target vocab size
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    i += 1;
+                    bpe_vocab_size = Some(args[i].parse().unwrap_or(BPE_VOCAB_SIZE));
+                } else {
+                    bpe_vocab_size = Some(BPE_VOCAB_SIZE);
                 }
             }
             other => {
@@ -121,9 +132,33 @@ fn main() -> std::io::Result<()> {
 
     println!("Training data size: {} characters", training_text.len());
 
-    let tokenizer = Tokenizer::from_text(&training_text);
+    // ── Build or load tokenizer ───────────────────────────────────────
+    let tokenizer = if let Some(target) = bpe_vocab_size {
+        if Path::new(BPE_VOCAB_PATH).exists() {
+            println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
+            match Tokenizer::load_bpe(BPE_VOCAB_PATH) {
+                Ok(t)  => { println!("Loaded BPE vocab ({} tokens)", t.vocab_size); t }
+                Err(e) => {
+                    eprintln!("Failed to load {}: {}. Retraining...", BPE_VOCAB_PATH, e);
+                    let t = Tokenizer::from_text_bpe(&training_text, target);
+                    t.save_bpe(BPE_VOCAB_PATH)?;
+                    println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+                    t
+                }
+            }
+        } else {
+            println!("Training BPE tokenizer (target vocab: {})...", target);
+            let t = Tokenizer::from_text_bpe(&training_text, target);
+            t.save_bpe(BPE_VOCAB_PATH)?;
+            println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+            t
+        }
+    } else {
+        Tokenizer::from_text(&training_text)
+    };
+
     println!("Vocabulary size: {}", tokenizer.vocab_size);
-    println!("Sample tokens: {:?}", &tokenizer.idx_to_char[..10.min(tokenizer.vocab_size)]);
+    println!("Sample tokens: {:?}", tokenizer.sample_tokens(10));
     println!();
 
     // 90/10 train/val split
