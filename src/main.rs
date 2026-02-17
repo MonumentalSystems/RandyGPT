@@ -91,8 +91,12 @@ fn main() -> std::io::Result<()> {
         println!("LR override: {} → {}", lr, min_lr);
     }
 
+    let model_size_name = if cfg!(feature = "model-s")  { "S (~1.1M)"  }
+                          else if cfg!(feature = "model-m")  { "M (~2.7M)"  }
+                          else if cfg!(feature = "model-xl") { "XL (~10.8M)"}
+                          else                               { "L (~4.82M)" };
     println!("=== Enhanced randyGPT ===");
-    println!("Model: {} layers, {} heads, {} embedding dim", N_LAYER, N_HEAD, N_EMBD);
+    println!("Model: {} — {} layers, {} heads, {}-dim", model_size_name, N_LAYER, N_HEAD, N_EMBD);
     println!("Block size: {}, Vocab size: up to {}", BLOCK_SIZE, MAX_VOCAB);
     println!();
 
