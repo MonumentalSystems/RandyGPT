@@ -15,7 +15,7 @@ pub const MAX_VOCAB: usize = 512;
 pub const BATCH_SIZE: usize = 64;
 // Gradient accumulation: run this many micro-batches before each optimizer step.
 // Effective batch = BATCH_SIZE * GRAD_ACCUM_STEPS. Set to 1 to disable.
-pub const GRAD_ACCUM_STEPS: usize = 4;
+pub const GRAD_ACCUM_STEPS: usize = 1;
 pub const LEARNING_RATE: f32 = 3e-5;
 pub const MIN_LEARNING_RATE: f32 = 3e-6;
 pub const WEIGHT_DECAY: f32 = 0.01;
