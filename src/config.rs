@@ -29,7 +29,7 @@ pub const GRAD_CLIP: f32 = 1.0;
 // Early stopping: halt if val loss hasn't improved for this many eval intervals.
 // Set to 0 to disable. E.g. with EVAL_INTERVAL=100 and patience=5 → stops after
 // 500 consecutive iters with no val improvement.
-pub const EARLY_STOP_PATIENCE: usize = 10;
+pub const EARLY_STOP_PATIENCE: usize = 20;
 
 // Metal
 pub const USE_METAL: bool = true;

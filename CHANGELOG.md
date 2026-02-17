@@ -4,35 +4,68 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 |
-|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay |
-| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 |
-| **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
-| **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules | 10 modules |
-| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~400MB real† | ~400MB real† |
-| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** |
-| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ | ~32min** |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** |
+| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 |
+| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** |
+| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** |
+| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 |
 
-†RSS ~400MB real; Activity Monitor shows ~3GB (Metal unified memory in virtual space — not CPU-resident)
+†RSS ~1GB real at T=256; Activity Monitor shows 4-8GB (Metal unified memory pool — not CPU-resident)
 ‡Estimated
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
-\*\*BLOCK_SIZE=256, BATCH_SIZE=64; ~1912ms/iter; val ppl 11.8 @iter 500 still improving (T=64 was 12.4 and degrading at iter 500)
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+
+---
+
+## [0.9.1] - 2026-02-17
+
+### Training Quality Fixes + `--lr` / `--min-lr` Flags
+
+#### `checkpoint_best.bin` Now Tracks Best Val Loss
+- Previously `checkpoint_best.bin` saved the checkpoint at the best *train* loss iteration — a misleading signal since train loss can diverge from val loss late in training
+- Fixed: `checkpoint_best.bin` now captures the checkpoint whenever `val_loss < best_val_loss` (patience reset), making it the true best-generalization checkpoint
+- `best_val_loss` seeded from checkpoint header on resume — patience counter starts relative to the previous run's best, not `f32::INFINITY`
+
+#### `--lr` and `--min-lr` CLI Flags
+- Override `LEARNING_RATE` and `MIN_LEARNING_RATE` at runtime without recompiling:
+  ```
+  ./randygpt --resume --iters 3000 --lr 1e-5 --min-lr 1e-6
+  ```
+- LR schedule ceiling and floor are now runtime parameters passed through to both `train()` and `train_candle()`
+- Printed at startup when overridden: `LR override: 0.00001 → 0.000001`
+- Enables fine-tuning runs at reduced LR from an existing checkpoint
+
+#### Confirmed v0.9.x Results (Shakespeare, ~4.82M params, T=256)
+| Metric | Value |
+|--------|-------|
+| Best val loss | **2.3716** |
+| Best val perplexity | **10.6** |
+| Iters to best | ~929 (from scratch) |
+| Speed | ~1835ms/iter |
+| Memory (real RSS) | ~1GB |
+| Memory (virtual) | 4–8GB (Metal pool, normal) |
+| LR at best | 3e-5 (full, pre-decay) |
+
+- T=256 context window outperforms T=64 peak (ppl 10.8): model sees full Shakespeare speeches per sample
+- Val floor ~2.37 is the data ceiling for 5M params on ~1MB Shakespeare corpus
+- Further improvement requires more data or a larger model (v1.0 roadmap)
 
 ---
 
@@ -480,11 +513,24 @@ Cores used: 12 available, ~8 effectively utilized
 - [x] 256-dim embeddings (4.77M params)
 - [x] Batch size 128, LR decay at 60%, ms/iter + ETA output
 
-### v1.0.0 - Production Ready
-- [ ] Multiple model size presets via CLI
+### v0.8.x - Full GPU + Context Window ✅ Done
+- [x] Full GPU AdamW via GpuAdamState (moments as Metal Vars)
+- [x] RGPT0003 checkpoint format (weights + moments)
+- [x] BLOCK_SIZE 64 → 256 (4× context window)
+- [x] Early stopping (patience=20, val-based)
+- [x] 50-sample val estimates for stability
+
+### v0.9.x - Training Quality ✅ Done
+- [x] `checkpoint_best.bin` tracks best val loss (not train loss)
+- [x] `best_val_loss` seeded from checkpoint on resume
+- [x] `--lr` / `--min-lr` CLI flags for runtime LR override
+- [x] Confirmed best: val ppl **10.6** (2.3716 loss) at T=256
+
+### v1.0.0 - More Data / Bigger Model
+- [ ] Multiple model size presets via CLI (S/M/L)
+- [ ] Larger training corpus (more than 1MB Shakespeare)
 - [ ] BPE tokenization
-- [ ] Model evaluation suite
-- [ ] Mixed precision training
+- [ ] Mixed precision (f16) training on Metal
 
 ---
 

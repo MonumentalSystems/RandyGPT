@@ -40,6 +40,8 @@ fn main() -> std::io::Result<()> {
     let args: Vec<String> = std::env::args().collect();
     let mut iterations = MAX_ITERS;
     let mut resume_path: Option<String> = None;
+    let mut lr_override:     Option<f32> = None;
+    let mut min_lr_override: Option<f32> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -57,6 +59,18 @@ fn main() -> std::io::Result<()> {
                     resume_path = Some("checkpoint.bin".to_string());
                 }
             }
+            "--lr" => {
+                i += 1;
+                if i < args.len() {
+                    lr_override = args[i].parse().ok();
+                }
+            }
+            "--min-lr" => {
+                i += 1;
+                if i < args.len() {
+                    min_lr_override = args[i].parse().ok();
+                }
+            }
             other => {
                 if let Ok(n) = other.parse::<usize>() {
                     iterations = n;
@@ -67,9 +81,14 @@ fn main() -> std::io::Result<()> {
         }
         i += 1;
     }
+    let lr     = lr_override.unwrap_or(LEARNING_RATE);
+    let min_lr = min_lr_override.unwrap_or(MIN_LEARNING_RATE);
 
     if resume_path.is_none() && Path::new("checkpoint.bin").exists() {
         eprintln!("Found checkpoint.bin — use --resume to continue from it, or delete it to start fresh.");
+    }
+    if lr_override.is_some() || min_lr_override.is_some() {
+        println!("LR override: {} → {}", lr, min_lr);
     }
 
     println!("=== Enhanced randyGPT ===");
@@ -243,12 +262,12 @@ fn main() -> std::io::Result<()> {
         // Sync step_t so bias correction starts correctly
         opt.step_t = step_start;
         train_candle(&mut candle_model, &mut opt, &data, &val_data, iterations, &mut rng,
-            iter_start, step_start, best_loss_start, ctrlc_flag);
+            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
         model = candle_model.to_gpt()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     } else {
         train(&mut model, &data, &val_data, iterations, &mut rng,
-            iter_start, step_start, best_loss_start, ctrlc_flag);
+            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
     }
 
     // ── Final loss estimate ───────────────────────────────────────────

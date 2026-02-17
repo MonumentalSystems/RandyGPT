@@ -136,13 +136,15 @@ pub fn train(
     iter_start: usize,
     step_start: usize,
     best_loss_start: f32,
+    max_lr: f32,
+    min_lr: f32,
     ctrlc_flag: Arc<AtomicBool>,
 ) {
     println!("=== Starting Training (Multi-Core with Rayon) ===");
     if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
     println!("Iterations: {} → {}", iter_start, iterations);
     println!("Batch size: {}", BATCH_SIZE);
-    println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
+    println!("Learning rate: {} → {}", max_lr, min_lr);
     println!("Gradient clipping: {}", GRAD_CLIP);
     println!("Cores available: {}", rayon::current_num_threads());
     println!();
@@ -458,7 +460,19 @@ pub fn train(
         batch_loss /= batch_starts.len() as f32;
         step += 1;
 
-        let lr = get_learning_rate(iter, iterations);
+        let lr = {
+            let warmup_iters = 100;
+            let decay_start  = (iterations * 3) / 5;
+            if iter < warmup_iters {
+                max_lr * (0.1 + 0.9 * iter as f32 / warmup_iters as f32)
+            } else if iter < decay_start {
+                max_lr
+            } else {
+                let progress = (iter - decay_start) as f32 / (iterations - decay_start) as f32;
+                let cosine   = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+                min_lr + (max_lr - min_lr) * cosine
+            }
+        };
 
         // Gradient clipping
         clip_gradients(&mut model.d_wte, GRAD_CLIP);
@@ -556,7 +570,7 @@ pub fn train(
                 println!();
                 println!("Early stopping: val loss hasn't improved for {} eval intervals ({} iters).",
                     EARLY_STOP_PATIENCE, EARLY_STOP_PATIENCE * EVAL_INTERVAL);
-                println!("Best val loss was {:.4}. Saving checkpoint and stopping.", best_val_loss);
+                println!("Best val loss was {:.4} @{}. Saving checkpoint and stopping.", best_loss, best_iter);
                 println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
                 flush_checkpoint("checkpoint.bin", &ckpt_buf)
                     .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
@@ -622,19 +636,19 @@ pub fn train_candle(
     iter_start: usize,
     step_start: usize,
     best_loss_start: f32,
+    max_lr: f32,
+    min_lr: f32,
     ctrlc_flag: Arc<AtomicBool>,
 ) {
     println!("=== Starting Training (Metal GPU via Candle) ===");
     if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
     println!("Iterations: {} → {}", iter_start, iterations);
     println!("Batch size: {} × {} accum steps = {} effective", BATCH_SIZE, GRAD_ACCUM_STEPS, BATCH_SIZE * GRAD_ACCUM_STEPS);
-    println!("Learning rate: {} → {}", LEARNING_RATE, MIN_LEARNING_RATE);
+    println!("Learning rate: {} → {}", max_lr, min_lr);
     println!();
 
     let device = model.device.clone();
     let mut step       = step_start;
-    let mut best_loss  = best_loss_start;
-    let mut best_iter  = if iter_start > 0 { iter_start.saturating_sub(1) } else { 0 };
 
     let mut ckpt_buf:      Vec<u8> = Vec::new();
     let mut ckpt_best_buf: Vec<u8> = Vec::new();
@@ -642,8 +656,8 @@ pub fn train_candle(
     let train_start    = Instant::now();
     let mut iter_count = 0u64;
     let mut total_iter_ms = 0u64;
-    let mut best_val_loss   = f32::INFINITY;  // tracks val loss for early stopping
-    let mut patience_count  = 0usize;         // consecutive evals with no val improvement
+    let mut best_val_loss   = best_loss_start; // tracks val loss for early stopping; seeded from checkpoint
+    let mut patience_count  = 0usize;          // consecutive evals with no val improvement
     let mut stop_early      = false;
 
     for iter in iter_start..iterations {
@@ -701,17 +715,24 @@ pub fn train_candle(
             .unwrap_or_else(|e| panic!("backward: {}", e));
 
         step += 1;
-        let lr = get_learning_rate(iter, iterations);
+        let lr = {
+            let warmup_iters = 100;
+            let decay_start  = (iterations * 3) / 5;
+            if iter < warmup_iters {
+                max_lr * (0.1 + 0.9 * iter as f32 / warmup_iters as f32)
+            } else if iter < decay_start {
+                max_lr
+            } else {
+                let progress = (iter - decay_start) as f32 / (iterations - decay_start) as f32;
+                let cosine   = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
+                min_lr + (max_lr - min_lr) * cosine
+            }
+        };
 
         // ── Full GPU AdamW: clip + update all Vars on Metal, no CPU transfer ──
         let vars = model.all_vars();
         opt.step(&grads, &vars, lr)
             .unwrap_or_else(|e| panic!("adam step: {}", e));
-
-        if batch_loss < best_loss {
-            best_loss = batch_loss;
-            best_iter = iter;
-        }
 
         iter_count    += 1;
         total_iter_ms += iter_start_time.elapsed().as_millis() as u64;
@@ -731,11 +752,12 @@ pub fn train_candle(
                 let val_loss = estimate_loss(&cpu_model, val_data, 50, rng);
                 let val_ppl  = val_loss.exp();
 
-                // Early stopping patience check
+                // Early stopping + best-val checkpoint tracking
                 if EARLY_STOP_PATIENCE > 0 {
                     if val_loss < best_val_loss {
                         best_val_loss  = val_loss;
                         patience_count = 0;
+                        // best_val checkpoint captured below after serialize
                     } else {
                         patience_count += 1;
                         if patience_count >= EARLY_STOP_PATIENCE {
@@ -750,18 +772,20 @@ pub fn train_candle(
                     String::new()
                 };
                 println!(
-                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best: {:.4} @{} | {}{}",
-                    iter, batch_loss, val_loss, val_ppl, lr, best_loss, best_iter, timing, patience_str
+                    "Iter {:4} | Loss: {:.4} | Val: {:.4} (ppl {:.1}) | LR: {:.6} | Best val: {:.4} | {}{}",
+                    iter, batch_loss, val_loss, val_ppl, lr, best_val_loss, timing, patience_str
                 );
             } else {
                 println!(
-                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best: {:.4} @{} | {}",
-                    iter, batch_loss, lr, best_loss, best_iter, timing
+                    "Iter {:4} | Loss: {:.4} | LR: {:.6} | Best val: {:.4} | {}",
+                    iter, batch_loss, lr, best_val_loss, timing
                 );
             }
 
-            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_loss);
-            if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
+            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss);
+            // checkpoint_best tracks best VAL loss, not train loss
+            if patience_count == 0 && EARLY_STOP_PATIENCE > 0 { ckpt_best_buf = ckpt_buf.clone(); }
+            else if ckpt_best_buf.is_empty() { ckpt_best_buf = ckpt_buf.clone(); }
 
             // ── Early stopping ────────────────────────────────────────
             if stop_early {
@@ -777,7 +801,7 @@ pub fn train_candle(
                     .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 if !ckpt_best_buf.is_empty() {
                     flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
-                        .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                        .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
                         .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 }
                 return;
@@ -786,10 +810,8 @@ pub fn train_candle(
 
         // ── Ctrl-C ────────────────────────────────────────────────────
         if ctrlc_flag.load(Ordering::Relaxed) {
-            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_loss);
-            if best_iter == iter || ckpt_best_buf.is_empty() {
-                ckpt_best_buf = ckpt_buf.clone();
-            }
+            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss);
+            if ckpt_best_buf.is_empty() { ckpt_best_buf = ckpt_buf.clone(); }
             let elapsed = train_start.elapsed().as_secs_f32();
             let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };
             println!();
@@ -799,7 +821,7 @@ pub fn train_candle(
                 .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
-                .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             std::process::exit(0);
         }
@@ -810,7 +832,7 @@ pub fn train_candle(
     println!();
     println!("Training complete! (Metal GPU)");
     println!("Total time:  {:.1}s | Avg: {:.0}ms/iter ({} iters)", total_elapsed, avg_ms, iter_count);
-    println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
+    println!("Best val loss: {:.4}", best_val_loss);
 
     if !ckpt_buf.is_empty() {
         flush_checkpoint("checkpoint.bin", &ckpt_buf)
