@@ -23,6 +23,9 @@ Thumbs.db
 # Training outputs
 checkpoints/
 logs/
+checkpoint.bin
+checkpoint_best.bin
+*.bin
 
 # Temporary files
 train_small.txt

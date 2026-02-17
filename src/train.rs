@@ -7,7 +7,7 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use candle_core::Tensor;
-use crate::checkpoint::{flush_checkpoint, serialize_checkpoint, serialize_checkpoint_v2};
+use crate::checkpoint::{flush_checkpoint, serialize_checkpoint, serialize_checkpoint_v3};
 use crate::config::*;
 use crate::forward::{forward, forward_candle_train, forward_metal_logits};
 use crate::model::{CandleModel, GPTModel, GradientBuffer};
@@ -15,7 +15,7 @@ use crate::ops::{
     clip_gradients, cross_entropy_loss, linear_bwd_dx_only, linear_bwd_dw_batched,
     softmax_bwd, softmax_fwd,
 };
-use crate::optimizer::{adam_step, get_learning_rate, zero_grads};
+use crate::optimizer::{adam_step, get_learning_rate, zero_grads, GpuAdamState};
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 use crate::metal::METAL_DEVICE;
@@ -572,6 +572,7 @@ pub fn train(
 /* ------------------------------------------------------------------ */
 pub fn train_candle(
     model: &mut CandleModel,
+    opt: &mut GpuAdamState,
     data: &[usize],
     val_data: &[usize],
     iterations: usize,
@@ -635,36 +636,10 @@ pub fn train_candle(
         step += 1;
         let lr = get_learning_rate(iter, iterations);
 
-        // ── AdamW update: pull grad, clip, adam_step on CPU, set Var ─
-        // var.set(&new_tensor) updates in-place without re-allocating the Var.
-        macro_rules! update_var {
-            ($var:expr, $m:expr, $v:expr, $shape:expr) => {{
-                if let Some(grad_t) = grads.get(&$var) {
-                    let mut g: Vec<f32> = grad_t.flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                    clip_gradients(&mut g, GRAD_CLIP);
-                    let mut w: Vec<f32> = $var.as_tensor().flatten_all().unwrap().to_vec1::<f32>().unwrap();
-                    adam_step(&mut w, &g, &mut $m, &mut $v, step, lr);
-                    let new_t = Tensor::from_slice(&w, $shape, &device).unwrap();
-                    $var.set(&new_t).unwrap();
-                }
-            }};
-        }
-
-        // Embeddings + LM head
-        update_var!(model.wte,     model.m_wte,     model.v_wte,     (model.vocab_size, N_EMBD));
-        update_var!(model.wpe,     model.m_wpe,     model.v_wpe,     (BLOCK_SIZE, N_EMBD));
-        update_var!(model.lm_head, model.m_lm_head, model.v_lm_head, (model.vocab_size, N_EMBD));
-
-        // Per-layer weights
-        for li in 0..N_LAYER {
-            let l = &mut model.layers[li];
-            update_var!(l.wq,  l.m_wq,  l.v_wq,  (N_EMBD, N_EMBD));
-            update_var!(l.wk,  l.m_wk,  l.v_wk,  (N_EMBD, N_EMBD));
-            update_var!(l.wv,  l.m_wv,  l.v_wv,  (N_EMBD, N_EMBD));
-            update_var!(l.wo,  l.m_wo,  l.v_wo,  (N_EMBD, N_EMBD));
-            update_var!(l.fc1, l.m_fc1, l.v_fc1, (MLP_DIM, N_EMBD));
-            update_var!(l.fc2, l.m_fc2, l.v_fc2, (N_EMBD, MLP_DIM));
-        }
+        // ── Full GPU AdamW: clip + update all Vars on Metal, no CPU transfer ──
+        let vars = model.all_vars();
+        opt.step(&grads, &vars, lr)
+            .unwrap_or_else(|e| panic!("adam step: {}", e));
 
         if batch_loss < best_loss {
             best_loss = batch_loss;
@@ -699,13 +674,13 @@ pub fn train_candle(
                 );
             }
 
-            ckpt_buf = serialize_checkpoint_v2(model, iter, step, best_loss);
+            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_loss);
             if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
         }
 
         // ── Ctrl-C ────────────────────────────────────────────────────
         if ctrlc_flag.load(Ordering::Relaxed) {
-            ckpt_buf = serialize_checkpoint_v2(model, iter, step, best_loss);
+            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_loss);
             if best_iter == iter || ckpt_best_buf.is_empty() {
                 ckpt_best_buf = ckpt_buf.clone();
             }

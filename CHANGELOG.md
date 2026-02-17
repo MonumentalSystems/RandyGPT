@@ -4,33 +4,77 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 |
-|---------|------|------|------|------|--------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay |
-| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ **training** |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 |
-| **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
-| **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules |
-| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~400MB real† |
-| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay |
+| **Initialization** | Random | Standard | Standard | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style | GPT-2 style |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 128 |
+| **Timing output** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ ms/iter + ETA | ✅ ms/iter + ETA | ✅ ms/iter + ETA |
+| **Code structure** | 1 file | 1 file | 1 file | 1 file | 1 file | 10 modules | 10 modules | 10 modules | 10 modules | 10 modules |
+| **Memory (RSS)** | ~50MB | ~100MB | ~300MB | 43GB⚠ | ~420MB | ~420MB | ~420MB | ~1.6GB | ~400MB real† | ~400MB real† |
+| **Speed (1000 iter)** | N/A | ~600s‡ | ~78s | ~450s | ~450s | ~450s | ~215s | ~96s§ | ~49s¶ | TBD |
 
 †RSS ~400MB real; Activity Monitor shows ~3GB (Metal unified memory in virtual space — not CPU-resident)
 ‡Estimated
 §SGEMM batched backward; measured ~964ms/iter CPU with 12 cores; batch=128
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
+
+---
+
+## [0.8.5] - 2026-02-16
+
+### Full GPU AdamW via GpuAdamState
+
+#### All Three Training Phases Now on Metal
+- **v0.8.0 hybrid**: Forward + backward on GPU; AdamW moments stayed on CPU (`Vec<f32>`)
+- **v0.8.5**: Optimizer moments now live as `Var` tensors on Metal — zero CPU transfers in the hot loop
+
+#### GpuAdamState
+- New `pub mod gpu_adam` in `optimizer.rs` with `GpuAdamState` struct
+- Moment Vars (`m`, `v`) allocated on the same Metal device as weight Vars via `Var::zeros()`
+- Full AdamW step as Candle tensor ops:
+  - Gradient clipping: `g.clamp(-GRAD_CLIP, GRAD_CLIP)?` (stays on GPU, no download)
+  - EMA updates: `m = m * β₁ + g * (1-β₁)`, `v = v * β₂ + g² * (1-β₂)`
+  - Bias correction: scalar multiply (no data movement)
+  - Weight decay: `θ *= (1 - lr * wd)` in-place via `Var::set()`
+  - Parameter update: `θ -= lr * m̂ / (√v̂ + ε)`
+  - All ops stay on GPU; `Var::set()` triggers no allocation
+
+#### CandleModel Simplification
+- Removed all `m_*/v_*` Vec<f32> moment fields from `CandleModel` and `CandleLayer`
+- `CandleLayer` is now 6 weight Vars only: `wq, wk, wv, wo, fc1, fc2`
+- New `all_vars()` method returns Vars in canonical order: `wte, wpe, lm_head, [N_LAYER × wq wk wv wo fc1 fc2]`
+- `GpuAdamState` indexed by the same order — guaranteed consistency
+- `var_to_vec` made `pub` for use in checkpoint serialization
+
+#### train_candle() Simplification
+- Replaced per-weight `update_var!` macro (9 calls per iteration) with:
+  ```rust
+  let vars = model.all_vars();
+  opt.step(&grads, &vars, lr).unwrap();
+  ```
+- One call handles all weights; GpuAdamState iterates over `grads.get(var)` internally
+
+#### RGPT0003 Checkpoint Format
+- New magic `b"RGPT0003"` — includes optimizer state as GPU Var data
+- Layout: header + weights (all_vars() order) + `opt.m` moments + `opt.v` moments
+- `serialize_checkpoint_v3(model, opt, iter, step, best_loss)` — pulls all data off GPU via `.flatten_all().to_vec1()`
+- `load_checkpoint_v3(path, model, opt)` — uploads weights and moments as Vars, restores `step_t`
+- Resume chain: RGPT0003 → RGPT0002 (weights only, fresh moments) → RGPT0001 (CPU path)
+- RGPT0002 `serialize_checkpoint_v2` kept but weights-only (moments now in GpuAdamState)
 
 ---
 

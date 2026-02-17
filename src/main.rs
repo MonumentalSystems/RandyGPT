@@ -14,10 +14,11 @@ use std::io::{BufRead, BufReader};
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use checkpoint::{load_checkpoint, load_checkpoint_v2};
+use checkpoint::{load_checkpoint, load_checkpoint_v2, load_checkpoint_v3};
 use config::*;
 use metal::METAL_DEVICE;
 use model::{CandleModel, GPTModel};
+use optimizer::GpuAdamState;
 use rng::Rng;
 use tokenizer::Tokenizer;
 use train::{estimate_loss, generate, train, train_candle};
@@ -133,19 +134,52 @@ fn main() -> std::io::Result<()> {
     println!();
 
     // ── Resume from checkpoint ────────────────────────────────────────
+    // On Metal: try RGPT0003, then RGPT0002 (moments reset), then RGPT0001.
+    // On CPU:   RGPT0001 only.
+    //
+    // candle_resume holds (CandleModel, GpuAdamState, iter, step, best_loss)
+    // if an RGPT0003 checkpoint was successfully loaded; otherwise None and
+    // the model weights are available in the CPU `model` variable.
+    let mut candle_resume: Option<(CandleModel, GpuAdamState, usize, usize, f32)> = None;
+
     let (iter_start, step_start, best_loss_start) = if let Some(ref ckpt) = resume_path {
-        // Try RGPT0002 first (Metal), then fall back to RGPT0001 (CPU)
-        let result = if use_metal {
+        let result: std::io::Result<(usize, usize, f32)> = if use_metal {
             let device = METAL_DEVICE.as_ref().unwrap();
-            let mut cm = CandleModel::from_gpt(&model, device)
-                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-            load_checkpoint_v2(ckpt, &mut cm).map(|r| {
-                model = cm.to_gpt().unwrap();
-                r
-            }).or_else(|_| load_checkpoint(ckpt, &mut model))
+
+            // Try RGPT0003 (full GPU state)
+            let r3 = {
+                let mut cm = CandleModel::from_gpt(&model, device)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                let vars = cm.all_vars();
+                let mut opt = GpuAdamState::new(&vars)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                load_checkpoint_v3(ckpt, &mut cm, &mut opt).map(|(it, st, bl)| {
+                    candle_resume = Some((cm, opt, it, st, bl));
+                    (it, st, bl)
+                })
+            };
+
+            if r3.is_ok() {
+                r3
+            } else {
+                // Try RGPT0002 (weights only, moments reset to zero)
+                let r2 = {
+                    let mut cm = CandleModel::from_gpt(&model, device)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    load_checkpoint_v2(ckpt, &mut cm).map(|(it, st, bl)| {
+                        let vars = cm.all_vars();
+                        let opt = GpuAdamState::new(&vars)
+                            .expect("GpuAdamState init failed");
+                        candle_resume = Some((cm, opt, it, st, bl));
+                        (it, st, bl)
+                    })
+                };
+                if r2.is_ok() { r2 } else { load_checkpoint(ckpt, &mut model) }
+            }
         } else {
             load_checkpoint(ckpt, &mut model)
         };
+
         match result {
             Ok((it, st, bl)) => {
                 println!("✓ Resumed from '{}' — iter {}, step {}, best loss {:.4}", ckpt, it, st, bl);
@@ -187,9 +221,19 @@ fn main() -> std::io::Result<()> {
     // ── Train ─────────────────────────────────────────────────────────
     if use_metal {
         let device = METAL_DEVICE.as_ref().unwrap();
-        let mut candle_model = CandleModel::from_gpt(&model, device)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-        train_candle(&mut candle_model, &data, &val_data, iterations, &mut rng,
+        let (mut candle_model, mut opt) = if let Some((cm, o, _, _, _)) = candle_resume {
+            (cm, o)
+        } else {
+            let cm = CandleModel::from_gpt(&model, device)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            let vars = cm.all_vars();
+            let o = GpuAdamState::new(&vars)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            (cm, o)
+        };
+        // Sync step_t so bias correction starts correctly
+        opt.step_t = step_start;
+        train_candle(&mut candle_model, &mut opt, &data, &val_data, iterations, &mut rng,
             iter_start, step_start, best_loss_start, ctrlc_flag);
         model = candle_model.to_gpt()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
