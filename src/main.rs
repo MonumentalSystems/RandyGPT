@@ -197,85 +197,116 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
-    // ── Load and split training data ──────────────────────────────────
-    let training_text = if Path::new("train.txt").exists() {
-        println!("Loading training data from train.txt...");
-        load_training_data("train.txt")?
-    } else {
-        println!("No train.txt found. Using default sample data.");
-        concat!(
-            "The quick brown fox jumps over the lazy dog. ",
-            "Rust is a systems programming language. ",
-            "Machine learning models learn from data. ",
-            "Transformers use attention mechanisms. ",
-            "GPT stands for Generative Pre-trained Transformer. ",
-            "Neural networks are inspired by the human brain. ",
-            "Deep learning is a subset of machine learning. "
-        ).to_string()
-    };
-
-    println!("Training data size: {} characters", training_text.len());
-
-    // ── Build or load tokenizer ───────────────────────────────────────
-    let tokenizer = if let Some(target) = bpe_vocab_size {
-        if Path::new(BPE_VOCAB_PATH).exists() {
-            println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
-            match Tokenizer::load_bpe(BPE_VOCAB_PATH) {
-                Ok(t)  => { println!("Loaded BPE vocab ({} tokens)", t.vocab_size); t }
-                Err(e) => {
-                    eprintln!("Failed to load {}: {}. Retraining...", BPE_VOCAB_PATH, e);
-                    let t = Tokenizer::from_text_bpe(&training_text, target);
-                    t.save_bpe(BPE_VOCAB_PATH)?;
-                    println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
-                    t
-                }
-            }
-        } else {
-            println!("Training BPE tokenizer (target vocab: {})...", target);
-            let t = Tokenizer::from_text_bpe(&training_text, target);
-            t.save_bpe(BPE_VOCAB_PATH)?;
-            println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
-            t
-        }
-    } else {
-        Tokenizer::from_text(&training_text)
-    };
-
-    println!("Vocabulary size: {}", tokenizer.vocab_size);
-    println!("Sample tokens: {:?}", tokenizer.sample_tokens(10));
-    println!();
-
-    // ── Tokenize (with binary cache) ──────────────────────────────────
+    // ── Load training data + tokenizer + tokens ─────────────────────────
+    // Memory optimization: if we have both tokens.bin and vocab.json cached,
+    // skip loading the raw training text entirely (saves ~110MB for large corpora).
     let token_cache_path = "tokens.bin";
-    let data_all = if Path::new(token_cache_path).exists() {
+    let have_token_cache = Path::new(token_cache_path).exists();
+    let have_bpe_vocab   = bpe_vocab_size.is_some() && Path::new(BPE_VOCAB_PATH).exists();
+
+    let (tokenizer, data, val_data) = if have_token_cache && have_bpe_vocab {
+        // Fast path: load vocab + cached tokens, skip raw text entirely
+        println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
+        let tokenizer = Tokenizer::load_bpe(BPE_VOCAB_PATH)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        println!("Loaded BPE vocab ({} tokens)", tokenizer.vocab_size);
+
         println!("Loading cached tokens from {}...", token_cache_path);
         let mut f = File::open(token_cache_path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
-        // tokens stored as u32 little-endian
-        let tokens: Vec<usize> = buf.chunks_exact(4)
+        let data_all: Vec<usize> = buf.chunks_exact(4)
             .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
             .collect();
-        println!("Loaded {} cached tokens", tokens.len());
-        tokens
+        drop(buf); // free raw bytes immediately
+        println!("Loaded {} cached tokens", data_all.len());
+
+        let val_split = (data_all.len() * 9) / 10;
+        let data     = data_all[..val_split].to_vec();
+        let val_data = data_all[val_split..].to_vec();
+        println!("Tokens: {} train, {} val (skipped train.txt — using cache)",
+            data.len(), val_data.len());
+        // data_all dropped here when it goes out of scope
+
+        (tokenizer, data, val_data)
     } else {
-        println!("Tokenizing text ({} chars)...", training_text.len());
-        let tokens = tokenizer.encode(&training_text);
-        // Save cache
-        let mut f = File::create(token_cache_path)?;
-        for &t in &tokens {
-            f.write_all(&(t as u32).to_le_bytes())?;
-        }
-        println!("Saved token cache to {} ({:.1}MB)",
-            token_cache_path, (tokens.len() * 4) as f64 / 1_048_576.0);
-        tokens
+        // Full path: load text, build/load tokenizer, tokenize, cache
+        let training_text = if Path::new("train.txt").exists() {
+            println!("Loading training data from train.txt...");
+            load_training_data("train.txt")?
+        } else {
+            println!("No train.txt found. Using default sample data.");
+            concat!(
+                "The quick brown fox jumps over the lazy dog. ",
+                "Rust is a systems programming language. ",
+                "Machine learning models learn from data. ",
+                "Transformers use attention mechanisms. ",
+                "GPT stands for Generative Pre-trained Transformer. ",
+                "Neural networks are inspired by the human brain. ",
+                "Deep learning is a subset of machine learning. "
+            ).to_string()
+        };
+        println!("Training data size: {} characters", training_text.len());
+
+        let tokenizer = if let Some(target) = bpe_vocab_size {
+            if Path::new(BPE_VOCAB_PATH).exists() {
+                println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
+                match Tokenizer::load_bpe(BPE_VOCAB_PATH) {
+                    Ok(t)  => { println!("Loaded BPE vocab ({} tokens)", t.vocab_size); t }
+                    Err(e) => {
+                        eprintln!("Failed to load {}: {}. Retraining...", BPE_VOCAB_PATH, e);
+                        let t = Tokenizer::from_text_bpe(&training_text, target);
+                        t.save_bpe(BPE_VOCAB_PATH)?;
+                        println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+                        t
+                    }
+                }
+            } else {
+                println!("Training BPE tokenizer (target vocab: {})...", target);
+                let t = Tokenizer::from_text_bpe(&training_text, target);
+                t.save_bpe(BPE_VOCAB_PATH)?;
+                println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+                t
+            }
+        } else {
+            Tokenizer::from_text(&training_text)
+        };
+
+        let data_all = if have_token_cache {
+            println!("Loading cached tokens from {}...", token_cache_path);
+            let mut f = File::open(token_cache_path)?;
+            let mut buf = Vec::new();
+            f.read_to_end(&mut buf)?;
+            let tokens: Vec<usize> = buf.chunks_exact(4)
+                .map(|c| u32::from_le_bytes([c[0], c[1], c[2], c[3]]) as usize)
+                .collect();
+            println!("Loaded {} cached tokens", tokens.len());
+            tokens
+        } else {
+            println!("Tokenizing text ({} chars)...", training_text.len());
+            let tokens = tokenizer.encode(&training_text);
+            let mut f = File::create(token_cache_path)?;
+            for &t in &tokens {
+                f.write_all(&(t as u32).to_le_bytes())?;
+            }
+            println!("Saved token cache to {} ({:.1}MB)",
+                token_cache_path, (tokens.len() * 4) as f64 / 1_048_576.0);
+            tokens
+        };
+        // training_text dropped here — frees ~110MB for large corpora
+
+        let val_split = (data_all.len() * 9) / 10;
+        let data     = data_all[..val_split].to_vec();
+        let val_data = data_all[val_split..].to_vec();
+        println!("Tokenized to {} tokens ({} train, {} val)",
+            data_all.len(), data.len(), val_data.len());
+        // data_all dropped here
+
+        (tokenizer, data, val_data)
     };
 
-    let val_split = (data_all.len() * 9) / 10;
-    let data     = data_all[..val_split].to_vec();
-    let val_data = data_all[val_split..].to_vec();
-    println!("Tokenized to {} tokens ({} train, {} val)",
-        data_all.len(), data.len(), val_data.len());
+    println!("Vocabulary size: {}", tokenizer.vocab_size);
+    println!();
 
     // ── Initialize model ──────────────────────────────────────────────
     println!("Initializing model...");
