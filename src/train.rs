@@ -26,6 +26,7 @@ use crate::metal::METAL_DEVICE;
 pub fn estimate_loss(
     model: &GPTModel,
     data: &[usize],
+    valid_starts: &[usize],
     eval_iters: usize,
     rng: &mut Rng,
 ) -> f32 {
@@ -35,7 +36,11 @@ pub fn estimate_loss(
     for _ in 0..eval_iters {
         if data.len() <= BLOCK_SIZE + 1 { continue; }
 
-        let start = rng.choice(data.len() - BLOCK_SIZE - 1);
+        let start = if !valid_starts.is_empty() {
+            valid_starts[rng.choice(valid_starts.len())]
+        } else {
+            rng.choice(data.len() - BLOCK_SIZE - 1)
+        };
         let x = &data[start..start + BLOCK_SIZE];
         let y = &data[start + 1..start + BLOCK_SIZE + 1];
 
@@ -164,6 +169,8 @@ pub fn train(
     model: &mut GPTModel,
     data: &[usize],
     val_data: &[usize],
+    valid_starts: &[usize],
+    val_valid_starts: &[usize],
     iterations: usize,
     rng: &mut Rng,
     iter_start: usize,
@@ -201,10 +208,12 @@ pub fn train(
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
-        // Sample batch indices
+        // Sample batch indices — from valid_starts if available (no cross-doc windows)
         let batch_starts: Vec<usize> = (0..BATCH_SIZE)
             .filter_map(|_| {
-                if data.len() > BLOCK_SIZE + 1 {
+                if !valid_starts.is_empty() {
+                    Some(valid_starts[rng.choice(valid_starts.len())])
+                } else if data.len() > BLOCK_SIZE + 1 {
                     Some(rng.choice(data.len() - BLOCK_SIZE - 1))
                 } else {
                     None
@@ -561,7 +570,7 @@ pub fn train(
             let timing  = format!("{:.0}ms/iter | {:.0}s elapsed | ETA {:.0}s", avg_ms, elapsed, eta_s);
 
             if !val_data.is_empty() {
-                let val_loss = estimate_loss(model, val_data, 50, rng);
+                let val_loss = estimate_loss(model, val_data, val_valid_starts, 50, rng);
                 let val_ppl  = val_loss.exp();
 
                 // ReduceLROnPlateau: reduce max_lr on patience exhaustion,
@@ -678,6 +687,8 @@ pub fn train_candle(
     opt: &mut GpuAdamState,
     data: &[usize],
     val_data: &[usize],
+    valid_starts: &[usize],
+    val_valid_starts: &[usize],
     iterations: usize,
     rng: &mut Rng,
     iter_start: usize,
@@ -724,7 +735,11 @@ pub fn train_candle(
             let mut tgt_data: Vec<u32> = Vec::with_capacity(BATCH_SIZE * BLOCK_SIZE);
             for _ in 0..BATCH_SIZE {
                 if data.len() <= BLOCK_SIZE + 1 { continue; }
-                let start = rng.choice(data.len() - BLOCK_SIZE - 1);
+                let start = if !valid_starts.is_empty() {
+                    valid_starts[rng.choice(valid_starts.len())]
+                } else {
+                    rng.choice(data.len() - BLOCK_SIZE - 1)
+                };
                 for t in 0..BLOCK_SIZE {
                     tok_data.push(data[start + t] as u32);
                     tgt_data.push(data[start + t + 1] as u32);
@@ -796,7 +811,7 @@ pub fn train_candle(
             if !val_data.is_empty() {
                 // Use CPU model for val loss (forward_metal_logits path unchanged)
                 let cpu_model = model.to_gpt().unwrap_or_else(|e| panic!("to_gpt: {}", e));
-                let val_loss = estimate_loss(&cpu_model, val_data, 50, rng);
+                let val_loss = estimate_loss(&cpu_model, val_data, val_valid_starts, 50, rng);
                 let val_ppl  = val_loss.exp();
 
                 // ReduceLROnPlateau: reduce max_lr on patience exhaustion,

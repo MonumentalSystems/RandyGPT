@@ -35,6 +35,30 @@ fn load_training_data(path: &str) -> std::io::Result<String> {
     Ok(text)
 }
 
+/// Build the list of valid batch start positions: windows of BLOCK_SIZE+1 tokens
+/// that don't cross a document boundary (<|eos|> = token id 1).
+/// Falls back to all positions when no separators are present.
+fn build_valid_starts(data: &[usize]) -> Vec<usize> {
+    use crate::config::BLOCK_SIZE;
+    if data.len() <= BLOCK_SIZE + 1 {
+        return Vec::new();
+    }
+    let eos_id = 1usize; // <|eos|> is always vocab index 1
+    let eos_positions: Vec<usize> = data.iter().enumerate()
+        .filter(|(_, &t)| t == eos_id)
+        .map(|(i, _)| i)
+        .collect();
+    if eos_positions.is_empty() {
+        return Vec::new(); // no separators — caller falls back to random
+    }
+    (0..data.len() - BLOCK_SIZE - 1)
+        .filter(|&s| {
+            let lo = eos_positions.partition_point(|&p| p < s);
+            lo >= eos_positions.len() || eos_positions[lo] >= s + BLOCK_SIZE
+        })
+        .collect()
+}
+
 fn main() -> std::io::Result<()> {
     // ── CLI arguments ─────────────────────────────────────────────────
     // Usage: randygpt [--iters N] [--resume [path]]
@@ -391,6 +415,16 @@ fn main() -> std::io::Result<()> {
     };
 
     println!("Vocabulary size: {}", tokenizer.vocab_size);
+
+    // Build document-boundary-aware valid start positions (empty = use random fallback)
+    let valid_starts     = build_valid_starts(&data);
+    let val_valid_starts = build_valid_starts(&val_data);
+    if !valid_starts.is_empty() {
+        let pct = 100.0 * valid_starts.len() as f64
+            / data.len().saturating_sub(crate::config::BLOCK_SIZE + 1) as f64;
+        println!("Doc-boundary sampling: {} valid train windows ({:.1}% of total)",
+            valid_starts.len(), pct);
+    }
     println!();
 
     // ── Initialize model ──────────────────────────────────────────────
@@ -495,8 +529,8 @@ fn main() -> std::io::Result<()> {
 
     // ── Initial loss estimate ─────────────────────────────────────────
     println!("Estimating initial loss...");
-    let initial_loss     = estimate_loss(&model, &data, 50, &mut rng);
-    let initial_val_loss = estimate_loss(&model, &val_data, 50, &mut rng);
+    let initial_loss     = estimate_loss(&model, &data, &valid_starts, 50, &mut rng);
+    let initial_val_loss = estimate_loss(&model, &val_data, &val_valid_starts, 50, &mut rng);
     println!("Initial loss: {:.4} | Val: {:.4} (ppl {:.1})",
         initial_loss, initial_val_loss, initial_val_loss.exp());
     println!();
@@ -524,19 +558,22 @@ fn main() -> std::io::Result<()> {
         };
         // Sync step_t so bias correction starts correctly
         opt.step_t = step_start;
-        train_candle(&mut candle_model, &mut opt, &data, &val_data, iterations, &mut rng,
+        train_candle(&mut candle_model, &mut opt, &data, &val_data,
+            &valid_starts, &val_valid_starts,
+            iterations, &mut rng,
             iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
         model = candle_model.to_gpt()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     } else {
-        train(&mut model, &data, &val_data, iterations, &mut rng,
+        train(&mut model, &data, &val_data, &valid_starts, &val_valid_starts,
+            iterations, &mut rng,
             iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
     }
 
     // ── Final loss estimate ───────────────────────────────────────────
     println!("Estimating final loss...");
-    let final_loss     = estimate_loss(&model, &data, 50, &mut rng);
-    let final_val_loss = estimate_loss(&model, &val_data, 50, &mut rng);
+    let final_loss     = estimate_loss(&model, &data, &valid_starts, 50, &mut rng);
+    let final_val_loss = estimate_loss(&model, &val_data, &val_valid_starts, 50, &mut rng);
     println!("Final train loss: {:.4} (started {:.4})", final_loss, initial_loss);
     println!("Final val loss:   {:.4} (ppl {:.1}, started {:.4})",
         final_val_loss, final_val_loss.exp(), initial_val_loss);
