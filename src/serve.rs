@@ -15,7 +15,8 @@ struct InferRequest {
     temperature: f32,
 }
 
-fn default_max_tokens() -> usize { 2048 }
+const MAX_TOKENS_LIMIT: usize = 200;
+fn default_max_tokens() -> usize { MAX_TOKENS_LIMIT }
 fn default_temperature() -> f32 { 0.7 }
 
 #[derive(Serialize)]
@@ -104,13 +105,14 @@ pub fn run_server(
             .unwrap_or(42);
         let mut rng = Rng::new(seed);
 
-        eprintln!("[serve] prompt={:?} max_tokens={} temperature={}", &req.prompt, req.max_tokens, req.temperature);
+        let max_tokens = req.max_tokens.min(MAX_TOKENS_LIMIT);
+        eprintln!("[serve] prompt={:?} max_tokens={} temperature={}", &req.prompt, max_tokens, req.temperature);
 
         let full_text = generate_cpu(
             model,
             tokenizer,
             &req.prompt,
-            req.max_tokens,
+            max_tokens,
             req.temperature,
             0.9,
             &mut rng,
