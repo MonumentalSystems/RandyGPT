@@ -36,6 +36,63 @@ All notable changes to randyGPT are documented here.
 
 ---
 
+## [0.9.5] - 2026-02-19
+
+### KV Cache, Generation Fix, LR Schedule, Serve Improvements, Linux Support
+
+#### True KV-Cache Autoregressive Generation (`forward.rs`, `train.rs`)
+- Added `start_pos: usize` parameter to `forward()` — enables single-token decode at any absolute sequence position
+- **Prefill phase**: prompt tokens processed once, populating the KV cache (`forward(&prompt, …, start_pos=0)`)
+- **Decode phase**: each new token runs `forward(&[token], …, start_pos=abs_pos)` — only Q/K/V projections for one token; prior K/V looked up from cache
+- Result: O(T) total work per decode step instead of O(T²) — eliminates re-processing all prior tokens each step
+- **Unit test** added: `kv_cache_single_token_matches_full_forward` — verifies prefill+single-token decode produces identical logits to full-sequence forward (tolerance 1e-4)
+- `forward_metal_logits_cpu` updated to pass `start_pos=0`; all training call sites updated
+
+#### Generation Output Fix (`train.rs`)
+- `generate_inner` now collects newly generated tokens in a separate `generated: Vec<usize>` and returns `tokenizer.decode(&generated)` — prompt is never included in the output
+- Fixes the root cause; removes the `strip_prefix` workaround that was previously patched in `serve.rs`
+
+#### ReduceLROnPlateau (`train.rs`, `config.rs`)
+- When patience is exhausted, `current_max_lr *= LR_REDUCTION_FACTOR` (default 0.5) and patience resets — training continues at lower LR
+- Repeats up to `MAX_LR_REDUCTIONS` times (default 3) before hard-stopping
+- Hard stop only fires after 3 consecutive reductions with no improvement — previously stopped after first plateau
+- LR reductions logged: `→ Plateau: LR reduced to 1.50e-5 (reduction 1/3)`
+- Status line updated: `Pat: 7/30 LRx1` shows patience count and reduction count together
+- Applied identically to both CPU and Metal training paths
+
+#### LR Warmup Removed (`train.rs`, `optimizer.rs`)
+- Removed 100-iteration linear warmup (was `0.1×max_lr → max_lr`)
+- Training now starts at full `max_lr` immediately — warmup is redundant given L∞ gradient clipping at 1.0 and Adam bias correction
+- `get_learning_rate()` in `optimizer.rs` updated to match (schedule: constant → cosine decay)
+
+#### Hyperparameter Tuning (`config.rs`)
+- `LEARNING_RATE`: 3e-5 → **1e-4** (scaled from GPT-2 small baseline for this batch/model size)
+- `MIN_LEARNING_RATE`: 3e-6 → **1e-5** (maintains 10:1 ratio)
+- `WEIGHT_DECAY`: 0.01 → **0.1** (stronger regularization for small-dataset regime)
+- `EARLY_STOP_PATIENCE`: 20 → **30** (more runway per LR level before reducing)
+
+#### Serve: Token Limit Removed (`serve.rs`)
+- Removed `MAX_TOKENS_LIMIT = 200` hard cap — was a workaround for O(T²) generation cost
+- Default `max_tokens` when not specified is now `BLOCK_SIZE` (256) — the model's natural context limit
+- `generate_inner` clamps to `BLOCK_SIZE` internally; no way to request more tokens than the context window
+
+#### Linux / Cross-Platform Build (`Cargo.toml`)
+- `candle-core` Metal feature made platform-conditional:
+  ```toml
+  [target.'cfg(target_os = "macos")'.dependencies]
+  candle-core = { version = "0.9.2", features = ["metal"] }
+  [target.'cfg(not(target_os = "macos"))'.dependencies]
+  candle-core = { version = "0.9.2" }
+  ```
+- Enables native Linux builds without modifying source — Metal paths degrade gracefully to CPU when `METAL_DEVICE` is None
+
+#### Deployment
+- Deployed to `oss.xenon.fun.local` as systemd service (`randygpt.service`)
+- Service builds natively on Ubuntu 24.04 x86_64 with `cargo build --release --features model-s`
+- No token output cap; prompt-stripped completions; true KV-cache decode
+
+---
+
 ## [0.9.4] - 2026-02-18
 
 ### HTTP Inference Server (`--serve`)
@@ -679,6 +736,11 @@ Cores used: 12 available, ~8 effectively utilized
 ---
 
 ## Future Roadmap
+
+### v1.1.0 - Gnostr Model Distribution (planned)
+- [ ] **Save checkpoints to gnostr** — publish trained model weights as nostr events via gnostr CLI
+- [ ] **Load models from gnostr** — fetch checkpoint by event ID or pubkey; feed directly into `--resume` path
+- [ ] Enables decentralized model sharing: train locally, publish to nostr relay, serve anywhere
 
 ### v0.4.0 - Quality Improvements ✅ Done
 - [x] Gradient clipping

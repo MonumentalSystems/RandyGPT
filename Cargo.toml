@@ -13,7 +13,6 @@ model-deep = [] # 192-dim, 6-head, 16-layer, ~7.5M params — depth experiment
 model-xl = []   # 384-dim, 8-head, 8-layer, ~10.8M params, ~4000ms/iter
 
 [dependencies]
-candle-core = { version = "0.9.2", features = ["metal"] }
 candle-nn = "0.9.2"
 ctrlc = "3.4"
 lazy_static = "1.5.0"
@@ -21,6 +20,13 @@ rayon = "1.8"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 tiny_http = "0.12"
+
+# Metal GPU acceleration on macOS only
+[target.'cfg(target_os = "macos")'.dependencies]
+candle-core = { version = "0.9.2", features = ["metal"] }
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+candle-core = { version = "0.9.2" }
 
 [profile.release]
 opt-level = 3

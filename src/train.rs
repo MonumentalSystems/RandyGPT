@@ -43,7 +43,7 @@ pub fn estimate_loss(
             forward_metal_logits(x, model)
         } else {
             let mut kv = (0..N_LAYER).map(|_| Vec::new()).collect();
-            let (logits, _) = forward(x, model, &mut kv, false, None);
+            let (logits, _) = forward(x, model, &mut kv, false, None, 0);
             logits
         };
 
@@ -93,41 +93,22 @@ fn generate_inner(
     temperature: f32,
     top_p: f32,
     rng: &mut Rng,
-    force_cpu: bool,
+    _force_cpu: bool,
 ) -> String {
     let mut tokens = tokenizer.encode(prompt);
     let max_len = BLOCK_SIZE.min(tokens.len() + max_new_tokens);
 
-    let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
-        (0..N_LAYER).map(|_| Vec::new()).collect();
-
-    while tokens.len() < max_len {
-        let logits_seq_metal;
-        let logits_seq_cpu;
-        let logits = if !force_cpu && METAL_DEVICE.is_some() {
-            logits_seq_metal = forward_metal_logits(&tokens, model);
-            &logits_seq_metal[logits_seq_metal.len() - 1]
-        } else {
-            let (seq, _) = forward(&tokens, model, &mut kv_cache, false, None);
-            logits_seq_cpu = seq;
-            &logits_seq_cpu[logits_seq_cpu.len() - 1]
-        };
-        let logits = logits.clone();
-
-        let mut probs = vec![0.0f32; model.vocab_size];
-        softmax_fwd(&logits, model.vocab_size, &mut probs, temperature);
-
-        // Top-p (nucleus) sampling
+    // Helper: sample the next token from a logits vector using top-p (nucleus) sampling.
+    let sample = |logits: &[f32], probs: &mut Vec<f32>, rng: &mut Rng| -> usize {
+        softmax_fwd(logits, model.vocab_size, probs, temperature);
         let mut sorted: Vec<usize> = (0..model.vocab_size).collect();
         sorted.sort_by(|&a, &b| probs[b].partial_cmp(&probs[a]).unwrap());
-
         let mut cumulative = 0.0f32;
         let mut cutoff = model.vocab_size;
         for (i, &idx) in sorted.iter().enumerate() {
             cumulative += probs[idx];
             if cumulative >= top_p { cutoff = i + 1; break; }
         }
-
         let top_sum: f32 = sorted[..cutoff].iter().map(|&i| probs[i]).sum();
         let mut r = rng.uniform() as f32 * top_sum;
         let mut next_token = sorted[0];
@@ -136,17 +117,44 @@ fn generate_inner(
             r -= probs[idx];
             if r <= 0.0 { next_token = idx; break; }
         }
+        next_token
+    };
 
+    let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
+        (0..N_LAYER).map(|_| Vec::new()).collect();
+
+    // Prefill: run the full prompt through forward() once to populate the KV cache.
+    let (prefill_logits, _) = forward(&tokens, model, &mut kv_cache, false, None, 0);
+    let mut last_logits = prefill_logits.last().unwrap().clone();
+    let mut probs = vec![0.0f32; model.vocab_size];
+
+    // Collect only the newly generated tokens so we never return the prompt.
+    let mut generated: Vec<usize> = Vec::new();
+
+    while tokens.len() < max_len {
+        let next_token = sample(&last_logits, &mut probs, rng);
         if next_token == tokenizer.eos_id { break; }
+        generated.push(next_token);
         tokens.push(next_token);
 
         if tokens.len() > BLOCK_SIZE {
+            // Slide the context window and rebuild the KV cache from scratch.
             tokens = tokens[1..].to_vec();
             kv_cache = (0..N_LAYER).map(|_| Vec::new()).collect();
+            let (logits, _) = forward(&tokens, model, &mut kv_cache, false, None, 0);
+            last_logits = logits.last().unwrap().clone();
+        } else {
+            // Decode: process only the single new token at its absolute position.
+            // The KV cache already holds entries for all prior positions, so this
+            // is O(context_len) attention but only O(1) embedding + projection work.
+            let abs_pos = tokens.len() - 1;
+            let (decode_logits, _) =
+                forward(&tokens[abs_pos..abs_pos + 1], model, &mut kv_cache, false, None, abs_pos);
+            last_logits = decode_logits.into_iter().next().unwrap();
         }
     }
 
-    tokenizer.decode(&tokens)
+    tokenizer.decode(&generated)
 }
 
 /* ------------------------------------------------------------------ */
@@ -188,6 +196,8 @@ pub fn train(
     let mut best_val_loss  = f32::INFINITY;
     let mut patience_count = 0usize;
     let mut stop_early     = false;
+    let mut current_max_lr = max_lr; // ReduceLROnPlateau: decreases on plateau
+    let mut lr_reductions  = 0usize;
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
@@ -218,7 +228,7 @@ pub fn train(
                 let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
                     (0..N_LAYER).map(|_| Vec::new()).collect();
                 let (logits_seq, acts) =
-                    forward(&x_vec, model_ref, &mut kv_cache, true, Some(&mut thread_rng));
+                    forward(&x_vec, model_ref, &mut kv_cache, true, Some(&mut thread_rng), 0);
 
                 let seq_len = logits_seq.len();
                 let mut local_grads = GradientBuffer::new(model_ref.vocab_size);
@@ -486,16 +496,13 @@ pub fn train(
         step += 1;
 
         let lr = {
-            let warmup_iters = 100;
-            let decay_start  = (iterations * 3) / 5;
-            if iter < warmup_iters {
-                max_lr * (0.1 + 0.9 * iter as f32 / warmup_iters as f32)
-            } else if iter < decay_start {
-                max_lr
+            let decay_start = (iterations * 3) / 5;
+            if iter < decay_start {
+                current_max_lr
             } else {
                 let progress = (iter - decay_start) as f32 / (iterations - decay_start) as f32;
                 let cosine   = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
-                min_lr + (max_lr - min_lr) * cosine
+                min_lr + (current_max_lr - min_lr) * cosine
             }
         };
 
@@ -557,7 +564,8 @@ pub fn train(
                 let val_loss = estimate_loss(model, val_data, 50, rng);
                 let val_ppl  = val_loss.exp();
 
-                // Early stopping patience check
+                // ReduceLROnPlateau: reduce max_lr on patience exhaustion,
+                // hard-stop only after MAX_LR_REDUCTIONS consecutive reductions.
                 if EARLY_STOP_PATIENCE > 0 {
                     if val_loss < best_val_loss {
                         best_val_loss  = val_loss;
@@ -565,13 +573,23 @@ pub fn train(
                     } else {
                         patience_count += 1;
                         if patience_count >= EARLY_STOP_PATIENCE {
-                            stop_early = true;
+                            if lr_reductions < MAX_LR_REDUCTIONS {
+                                current_max_lr = (current_max_lr * LR_REDUCTION_FACTOR).max(min_lr);
+                                lr_reductions += 1;
+                                patience_count = 0;
+                                println!(
+                                    "  → Plateau: LR reduced to {:.2e} (reduction {}/{})",
+                                    current_max_lr, lr_reductions, MAX_LR_REDUCTIONS
+                                );
+                            } else {
+                                stop_early = true;
+                            }
                         }
                     }
                 }
 
                 let patience_str = if EARLY_STOP_PATIENCE > 0 {
-                    format!(" | Patience: {}/{}", patience_count, EARLY_STOP_PATIENCE)
+                    format!(" | Pat: {}/{} LRx{}", patience_count, EARLY_STOP_PATIENCE, lr_reductions)
                 } else {
                     String::new()
                 };
@@ -684,6 +702,8 @@ pub fn train_candle(
     let mut best_val_loss   = best_loss_start; // tracks val loss for early stopping; seeded from checkpoint
     let mut patience_count  = 0usize;          // consecutive evals with no val improvement
     let mut stop_early      = false;
+    let mut current_max_lr  = max_lr;          // ReduceLROnPlateau: decreases on plateau
+    let mut lr_reductions   = 0usize;
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
@@ -741,16 +761,13 @@ pub fn train_candle(
 
         step += 1;
         let lr = {
-            let warmup_iters = 100;
-            let decay_start  = (iterations * 3) / 5;
-            if iter < warmup_iters {
-                max_lr * (0.1 + 0.9 * iter as f32 / warmup_iters as f32)
-            } else if iter < decay_start {
-                max_lr
+            let decay_start = (iterations * 3) / 5;
+            if iter < decay_start {
+                current_max_lr
             } else {
                 let progress = (iter - decay_start) as f32 / (iterations - decay_start) as f32;
                 let cosine   = 0.5 * (1.0 + (progress * std::f32::consts::PI).cos());
-                min_lr + (max_lr - min_lr) * cosine
+                min_lr + (current_max_lr - min_lr) * cosine
             }
         };
 
@@ -777,7 +794,8 @@ pub fn train_candle(
                 let val_loss = estimate_loss(&cpu_model, val_data, 50, rng);
                 let val_ppl  = val_loss.exp();
 
-                // Early stopping + best-val checkpoint tracking
+                // ReduceLROnPlateau: reduce max_lr on patience exhaustion,
+                // hard-stop only after MAX_LR_REDUCTIONS consecutive reductions.
                 if EARLY_STOP_PATIENCE > 0 {
                     if val_loss < best_val_loss {
                         best_val_loss  = val_loss;
@@ -786,13 +804,23 @@ pub fn train_candle(
                     } else {
                         patience_count += 1;
                         if patience_count >= EARLY_STOP_PATIENCE {
-                            stop_early = true;
+                            if lr_reductions < MAX_LR_REDUCTIONS {
+                                current_max_lr = (current_max_lr * LR_REDUCTION_FACTOR).max(min_lr);
+                                lr_reductions += 1;
+                                patience_count = 0;
+                                println!(
+                                    "  → Plateau: LR reduced to {:.2e} (reduction {}/{})",
+                                    current_max_lr, lr_reductions, MAX_LR_REDUCTIONS
+                                );
+                            } else {
+                                stop_early = true;
+                            }
                         }
                     }
                 }
 
                 let patience_str = if EARLY_STOP_PATIENCE > 0 {
-                    format!(" | Patience: {}/{}", patience_count, EARLY_STOP_PATIENCE)
+                    format!(" | Pat: {}/{} LRx{}", patience_count, EARLY_STOP_PATIENCE, lr_reductions)
                 } else {
                     String::new()
                 };

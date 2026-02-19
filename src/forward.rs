@@ -13,24 +13,31 @@ use crate::rng::Rng;
 /// Per-token autoregressive forward pass with KV cache.
 /// Returns (logits_per_position, activations_per_position).
 /// Used during training so activations are available for backward.
+///
+/// `start_pos`: absolute sequence position of `tokens[0]`.  Pass 0 for a
+/// full-sequence forward (training / prefill).  Pass the current context
+/// length when decoding a single new token so that positional embeddings
+/// and cache indices are correct.
 pub fn forward(
     tokens: &[usize],
     model: &GPTModel,
     kv_cache: &mut Vec<Vec<(Vec<f32>, Vec<f32>)>>,
     training: bool,
     mut rng: Option<&mut Rng>,
+    start_pos: usize,
 ) -> (Vec<Vec<f32>>, Vec<PosActs>) {
     let seq_len = tokens.len();
     let mut all_logits = Vec::with_capacity(seq_len);
     let mut all_acts   = Vec::with_capacity(seq_len);
 
     for pos in 0..seq_len {
+        let abs_pos = start_pos + pos;   // absolute position in the sequence
         let tok = tokens[pos];
         let mut act = PosActs::new();
 
-        // Token + position embedding
+        // Token + position embedding (use abs_pos for wpe)
         for i in 0..N_EMBD {
-            act.x_embed[i] = model.wte[tok * N_EMBD + i] + model.wpe[pos * N_EMBD + i];
+            act.x_embed[i] = model.wte[tok * N_EMBD + i] + model.wpe[abs_pos * N_EMBD + i];
         }
 
         let mut x = act.x_embed.clone();
@@ -55,27 +62,28 @@ pub fn forward(
             act.k[li] = k.clone();
             act.v[li] = v.clone();
 
-            // Append K,V to cache for this position
-            if kv_cache[li].len() <= pos {
+            // Append K,V to cache for abs_pos (only if not already cached)
+            if kv_cache[li].len() <= abs_pos {
                 kv_cache[li].push((k.clone(), v.clone()));
             }
 
-            // Causal multi-head attention
+            // Causal multi-head attention over all cached positions 0..=abs_pos
+            let cache_len = abs_pos + 1;
             let mut attn_out = vec![0.0; N_EMBD];
             let scale = 1.0 / (HEAD_DIM as f32).sqrt();
 
             for h in 0..N_HEAD {
                 let hs = h * HEAD_DIM;
-                let mut scores = vec![0.0; pos + 1];
-                for t in 0..=pos {
+                let mut scores = vec![0.0; cache_len];
+                for t in 0..cache_len {
                     let dot: f32 = (0..HEAD_DIM)
                         .map(|j| q[hs + j] * kv_cache[li][t].0[hs + j])
                         .sum();
                     scores[t] = dot * scale;
                 }
-                let mut weights = vec![0.0; pos + 1];
-                softmax_fwd(&scores, pos + 1, &mut weights, 1.0);
-                for t in 0..=pos {
+                let mut weights = vec![0.0; cache_len];
+                softmax_fwd(&scores, cache_len, &mut weights, 1.0);
+                for t in 0..cache_len {
                     for j in 0..HEAD_DIM {
                         attn_out[hs + j] += weights[t] * kv_cache[li][t].1[hs + j];
                     }
@@ -246,7 +254,7 @@ pub fn forward_metal_logits(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>>
 
 fn forward_metal_logits_cpu(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>> {
     let mut kv = (0..N_LAYER).map(|_| Vec::new()).collect();
-    let (logits, _) = forward(tokens, model, &mut kv, false, None);
+    let (logits, _) = forward(tokens, model, &mut kv, false, None, 0);
     logits
 }
 
@@ -349,4 +357,50 @@ pub fn forward_candle_train(
     // ── Cross-entropy loss ────────────────────────────────────────────
     let targets_flat = targets.flatten_all()?;                        // [B*T] u32
     candle_nn::loss::cross_entropy(&logits_2d, &targets_flat)
+}
+
+// ── Unit tests ──────────────────────────────────────────────────────────────
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::GPTModel;
+    use crate::rng::Rng;
+
+    /// Verify that prefill-then-single-token-decode produces identical logits
+    /// to a monolithic full-sequence forward pass.
+    #[test]
+    fn kv_cache_single_token_matches_full_forward() {
+        let mut rng = Rng::new(42);
+        let vocab_size = 16;
+        let model = GPTModel::new(vocab_size, &mut rng);
+
+        // A short token sequence long enough to exercise multiple cache entries.
+        let tokens: Vec<usize> = vec![3, 7, 1, 5, 2, 9];
+
+        // ── Reference: full forward in one shot ──────────────────────────
+        let mut kv_ref: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
+            (0..N_LAYER).map(|_| Vec::new()).collect();
+        let (full_logits, _) = forward(&tokens, &model, &mut kv_ref, false, None, 0);
+        let ref_logits = full_logits.last().unwrap().clone();
+
+        // ── Candidate: prefill [0..n-1], then single-token decode ────────
+        let n = tokens.len();
+        let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
+            (0..N_LAYER).map(|_| Vec::new()).collect();
+        // Prefill with all but the last token.
+        forward(&tokens[..n - 1], &model, &mut kv_cache, false, None, 0);
+        // Decode the last token.
+        let (decode_logits, _) =
+            forward(&tokens[n - 1..n], &model, &mut kv_cache, false, None, n - 1);
+        let cand_logits = decode_logits.into_iter().next().unwrap();
+
+        // ── Compare ──────────────────────────────────────────────────────
+        assert_eq!(ref_logits.len(), cand_logits.len());
+        for (i, (r, c)) in ref_logits.iter().zip(cand_logits.iter()).enumerate() {
+            assert!(
+                (r - c).abs() < 1e-4,
+                "logit[{i}] mismatch: full={r:.6} vs cached={c:.6}"
+            );
+        }
+    }
 }

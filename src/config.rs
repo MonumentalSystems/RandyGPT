@@ -84,9 +84,9 @@ pub const BATCH_SIZE: usize = 64;
 // Gradient accumulation — kept at 1 for all models.
 // accum>1 causes Metal GPU stalls (system freezes ~10s, interrupts blocked).
 pub const GRAD_ACCUM_STEPS: usize = 1;
-pub const LEARNING_RATE: f32 = 3e-5;
-pub const MIN_LEARNING_RATE: f32 = 3e-6;
-pub const WEIGHT_DECAY: f32 = 0.01;
+pub const LEARNING_RATE: f32 = 1e-4;       // raised from 3e-5; ~4× faster convergence
+pub const MIN_LEARNING_RATE: f32 = 1e-5;   // 10% of max (was 3e-6)
+pub const WEIGHT_DECAY: f32 = 0.1;         // raised from 0.01; more regularization for small dataset
 pub const DROPOUT_RATE: f32 = 0.1;
 pub const BETA1: f32 = 0.9;
 pub const BETA2: f32 = 0.999;
@@ -95,9 +95,14 @@ pub const MAX_ITERS: usize = 1000;
 pub const EVAL_INTERVAL: usize = 25;
 pub const GRAD_CLIP: f32 = 1.0;
 // Early stopping: halt if val loss hasn't improved for this many eval intervals.
-// Set to 0 to disable. E.g. patience=20 + EVAL_INTERVAL=10 → stops after
-// 200 consecutive iters with no val improvement.
-pub const EARLY_STOP_PATIENCE: usize = 20;
+// Set to 0 to disable. E.g. patience=20 + EVAL_INTERVAL=25 → stops after
+// 500 consecutive iters with no val improvement.
+pub const EARLY_STOP_PATIENCE: usize = 30;
+// ReduceLROnPlateau: when patience is exhausted, reduce max_lr by this factor
+// and reset patience instead of stopping.  Repeats up to MAX_LR_REDUCTIONS
+// times before giving up entirely.
+pub const LR_REDUCTION_FACTOR: f32  = 0.5;
+pub const MAX_LR_REDUCTIONS:   usize = 3;
 
 // ── Metal ─────────────────────────────────────────────────────────────────
 

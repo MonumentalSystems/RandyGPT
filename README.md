@@ -5,29 +5,37 @@ A GPT-style language model implemented from scratch in Rust. Training runs on Me
 ## Features
 
 - **Transformer Architecture**: Multi-head causal attention, feed-forward layers, residual connections, RMSNorm
-- **Metal GPU Training**: Candle autograd on Apple M-series — forward + backward on GPU, AdamW on CPU
-- **CPU Fallback**: Rayon multi-core + Accelerate BLAS (sgemm batched backward) when Metal unavailable
-- **Full Training Loop**: AdamW optimizer, gradient clipping, dropout, LR warmup + cosine decay
+- **Metal GPU Training**: Candle autograd on Apple M-series — forward + backward + AdamW fully on GPU
+- **CPU / Linux Fallback**: Rayon multi-core + Accelerate BLAS when Metal unavailable; builds natively on Linux
+- **Full Training Loop**: AdamW, gradient clipping, dropout, ReduceLROnPlateau, cosine decay
 - **GPT-2 Style Init**: Scaled output projections for stable deep training
-- **Checkpoint Save/Resume**: RGPT0002 format; save and continue across sessions
+- **Checkpoint Save/Resume**: RGPT0003 format (weights + optimizer moments); resumes LR schedule exactly
 - **Character-Level + BPE Tokenization**: char vocab or learned BPE with `--bpe [N]`
-- **KV Cache**: Efficient autoregressive generation
+- **True KV Cache**: Single-token decode — prefill prompt once, O(1) projections per new token
 - **Top-P + Temperature Sampling**: Nucleus sampling for text generation
-- **HTTP Inference Server**: `--serve` flag exposes a POST endpoint for on-demand generation
+- **HTTP Inference Server**: `--serve` flag; no output token cap; returns completion only (prompt stripped)
 
-## Current Model Configuration (v0.8.0)
+## Model Presets (select at build time)
+
+| Preset | Dim | Heads | Layers | Params | Build flag |
+|--------|-----|-------|--------|--------|------------|
+| model-xs | 116 | 4 | 3 | ~746K | `--features model-xs` |
+| **model-s** | **128** | **4** | **8** | **~1.6M** | `--features model-s` |
+| model-m | 192 | 6 | 6 | ~2.7M | `--features model-m` |
+| model-l *(default)* | 256 | 8 | 6 | ~4.82M | *(none)* |
+| model-deep | 192 | 6 | 16 | ~7.5M | `--features model-deep` |
+| model-xl | 384 | 8 | 8 | ~10.8M | `--features model-xl` |
+
+Default hyperparameters (v0.9.5):
 
 | Hyperparameter | Value |
 |----------------|-------|
-| Embedding dim | 256 |
-| Attention heads | 8 |
-| Layers | 6 |
-| Block size | 64 tokens |
-| MLP hidden dim | 1024 (4× embd) |
-| Parameters | ~4.77M |
+| Block size | 256 tokens |
+| Batch size | 64 |
+| Learning rate | 1e-4 → 1e-5 (cosine) |
+| Weight decay | 0.1 |
 | Dropout | 0.1 |
-| Optimizer | AdamW (wd=0.01) |
-| Batch size | 128 |
+| Early stopping | ReduceLROnPlateau (patience=30, ×3 reductions) |
 
 ## Usage
 
@@ -40,7 +48,12 @@ cargo build --release
 ### Train from scratch
 
 ```bash
-./target/release/randygpt --iters 1000
+# model-l (default), char-level
+./target/release/randygpt --iters 5000
+
+# model-s with BPE-500 vocab (recommended for novels dataset)
+cargo build --release --features model-s
+./target/release/randygpt --iters 25000 --bpe 500
 ```
 
 ### Resume training from a checkpoint
@@ -81,7 +94,7 @@ curl -s http://localhost:8080/ \
 | Field | Default | Description |
 |-------|---------|-------------|
 | `prompt` | required | Text prompt |
-| `max_tokens` | 2048 | Maximum tokens to generate |
+| `max_tokens` | 256 (BLOCK_SIZE) | Max new tokens; capped at context window |
 | `temperature` | 0.7 | Sampling temperature |
 
 If `--api-key` is set, every request must include `Authorization: Bearer <key>`.
@@ -126,11 +139,11 @@ If `train.txt` is absent, the model falls back to a tiny built-in sample.
 
 ### Training (Metal GPU path)
 
-- **Forward + Backward**: Candle autograd on Metal — fully batched `[128, 64, 256]` tensor ops
+- **Forward + Backward**: Candle autograd on Metal — fully batched `[B, T, D]` tensor ops
 - **Loss**: `candle_nn::loss::cross_entropy` over all sequence positions
-- **Gradients**: `loss.backward()` → `GradStore` → pulled to CPU via `.to_vec1::<f32>()`
-- **Optimizer**: AdamW moments stay on CPU; updated weights re-uploaded via `Var::set()`
+- **Optimizer**: Full GPU AdamW via `GpuAdamState` — moments live as Metal `Var`s, zero CPU transfers in hot loop
 - **Gradient clipping**: L∞ norm clipped at 1.0
+- **LR schedule**: constant at `max_lr` → cosine decay to `min_lr` over final 40%; ReduceLROnPlateau halves `max_lr` on stagnation (up to 3×)
 
 ### Training (CPU fallback)
 
@@ -172,6 +185,16 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] BPE tokenization with `--bpe [N]` flag (v0.9.2)
 - [x] Fast CPU-only `--generate` mode (v0.9.3)
 - [x] HTTP inference server via `--serve` (v0.9.4)
+- [x] True KV-cache single-token decode (v0.9.5)
+- [x] Generation returns completion only — prompt stripped (v0.9.5)
+- [x] ReduceLROnPlateau — halves LR on stagnation, resumes; no premature early stop (v0.9.5)
+- [x] LR warmup removed — redundant with gradient clipping + Adam bias correction (v0.9.5)
+- [x] Linux / cross-platform builds — Metal conditional on macOS (v0.9.5)
+- [x] Systemd deployment to `oss.xenon.fun.local` (v0.9.5)
+
+## Planned
+
+- [ ] **Gnostr model distribution** — publish/fetch checkpoints as nostr events via gnostr CLI
 
 ## Credits
 

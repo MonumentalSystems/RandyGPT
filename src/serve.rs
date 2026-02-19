@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 use tiny_http::{Header, Method, Response, Server, StatusCode};
 
+use crate::config::BLOCK_SIZE;
 use crate::model::GPTModel;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
@@ -15,8 +16,7 @@ struct InferRequest {
     temperature: f32,
 }
 
-const MAX_TOKENS_LIMIT: usize = 200;
-fn default_max_tokens() -> usize { MAX_TOKENS_LIMIT }
+fn default_max_tokens() -> usize { BLOCK_SIZE }
 fn default_temperature() -> f32 { 0.7 }
 
 #[derive(Serialize)]
@@ -105,10 +105,10 @@ pub fn run_server(
             .unwrap_or(42);
         let mut rng = Rng::new(seed);
 
-        let max_tokens = req.max_tokens.min(MAX_TOKENS_LIMIT);
+        let max_tokens = req.max_tokens;
         eprintln!("[serve] prompt={:?} max_tokens={} temperature={}", &req.prompt, max_tokens, req.temperature);
 
-        let full_text = generate_cpu(
+        let completion = generate_cpu(
             model,
             tokenizer,
             &req.prompt,
@@ -117,12 +117,6 @@ pub fn run_server(
             0.9,
             &mut rng,
         );
-
-        // generate_cpu returns prompt + completion; strip the prompt prefix
-        let completion = full_text
-            .strip_prefix(&req.prompt)
-            .unwrap_or(&full_text)
-            .to_string();
 
         let completion_tokens = tokenizer.encode(&completion).len();
 
