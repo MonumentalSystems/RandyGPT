@@ -108,7 +108,9 @@ Weights are serialized to memory every `EVAL_INTERVAL` iterations and flushed to
 | `checkpoint.bin` | Latest periodic checkpoint |
 | `checkpoint_best.bin` | Best-loss checkpoint |
 
-Both files use the RGPT0002 format and include model weights + full AdamW optimizer state, so the LR schedule resumes correctly from exactly where you left off.
+Both files use the RGPT0003 format and include model weights + full AdamW optimizer state, so the LR schedule resumes correctly from exactly where you left off.
+
+`checkpoint_best.bin` is written to disk immediately whenever validation loss improves.
 
 Checkpoint size: ~55 MB for the current 4.77M-param config.
 
@@ -191,6 +193,54 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] LR warmup removed — redundant with gradient clipping + Adam bias correction (v0.9.5)
 - [x] Linux / cross-platform builds — Metal conditional on macOS (v0.9.5)
 - [x] Systemd deployment to `oss.xenon.fun.local` (v0.9.5)
+- [x] Gutenberg corpus cleaning + deduplication (`scripts/clean_gutenberg.py`) (v0.9.6)
+- [x] Document-boundary-aware batch sampling — no batches crossing `<|eos|>` separators (v0.9.6)
+- [x] Best checkpoint flushed to disk immediately on val loss improvement (v0.9.6)
+- [x] HuggingFace export — safetensors + PyTorch modeling + tokenizer scripts (v0.9.6)
+- [x] HuggingFace Space — Gradio UI loading model from Hub (v0.9.6)
+
+## HuggingFace Export & Deployment
+
+Export a trained checkpoint to HuggingFace format and publish to the Hub in one step:
+
+```bash
+./scripts/publish_hf.sh                        # model-s, checkpoint_best.bin (defaults)
+./scripts/publish_hf.sh s checkpoint_best.bin  # explicit
+```
+
+This script:
+1. Runs `scripts/export_hf.py` → produces `hf_export/` with `model.safetensors`, `config.json`, `tokenizer.json`, etc.
+2. Uploads model weights to `MonumentalSystems/randygpt-{size}` on the Hub
+3. Uploads the Gradio Space to `MonumentalSystems/randygpt-space`
+
+### One-time Space setup
+
+```bash
+hf repo create MonumentalSystems/randygpt-space --repo-type space --space-sdk gradio
+```
+
+### Export scripts
+
+| Script | Purpose |
+|--------|---------|
+| `scripts/export_hf.py` | Export RGPT0003 checkpoint → safetensors + HF config files |
+| `scripts/modeling_randygpt.py` | PyTorch `PreTrainedModel` matching the Rust forward pass exactly |
+| `scripts/tokenizer_randygpt.py` | Python BPE tokenizer matching the Rust encoder exactly |
+| `scripts/publish_hf.sh` | One-shot export + upload to Hub + upload Space |
+| `spaces/app.py` | Gradio Space — loads model from Hub, HF hosts the compute |
+
+### Manual export
+
+```bash
+python3 scripts/export_hf.py \
+    --checkpoint checkpoint_best.bin \
+    --vocab vocab.json \
+    --output hf_export \
+    --model-size s \
+    --repo MonumentalSystems/randygpt-s
+
+hf upload MonumentalSystems/randygpt-s ./hf_export . --repo-type model
+```
 
 ## Planned
 
