@@ -604,7 +604,11 @@ pub fn train(
                 );
             }
             ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
-            if best_iter == iter { ckpt_best_buf = ckpt_buf.clone(); }
+            if best_iter == iter {
+                ckpt_best_buf = ckpt_buf.clone();
+                flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                    .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
+            }
 
             // Early stopping break
             if stop_early {
@@ -788,6 +792,7 @@ pub fn train_candle(
             let eta_s = avg_ms * remaining_iters as f32 / 1000.0;
             let timing = format!("{:.0}ms/iter | {:.0}s elapsed | ETA {:.0}s", avg_ms, elapsed, eta_s);
 
+            let mut new_best = false;
             if !val_data.is_empty() {
                 // Use CPU model for val loss (forward_metal_logits path unchanged)
                 let cpu_model = model.to_gpt().unwrap_or_else(|e| panic!("to_gpt: {}", e));
@@ -796,11 +801,11 @@ pub fn train_candle(
 
                 // ReduceLROnPlateau: reduce max_lr on patience exhaustion,
                 // hard-stop only after MAX_LR_REDUCTIONS consecutive reductions.
+                new_best = val_loss < best_val_loss;
                 if EARLY_STOP_PATIENCE > 0 {
-                    if val_loss < best_val_loss {
+                    if new_best {
                         best_val_loss  = val_loss;
                         patience_count = 0;
-                        // best_val checkpoint captured below after serialize
                     } else {
                         patience_count += 1;
                         if patience_count >= EARLY_STOP_PATIENCE {
@@ -837,8 +842,13 @@ pub fn train_candle(
 
             ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss);
             // checkpoint_best tracks best VAL loss, not train loss
-            if patience_count == 0 && EARLY_STOP_PATIENCE > 0 { ckpt_best_buf = ckpt_buf.clone(); }
-            else if ckpt_best_buf.is_empty() { ckpt_best_buf = ckpt_buf.clone(); }
+            if new_best || ckpt_best_buf.is_empty() {
+                ckpt_best_buf = ckpt_buf.clone();
+                if new_best {
+                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                        .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
+                }
+            }
 
             // ── Early stopping ────────────────────────────────────────
             if stop_early {
