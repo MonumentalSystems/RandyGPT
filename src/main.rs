@@ -37,7 +37,11 @@ fn load_training_data(path: &str) -> std::io::Result<String> {
 
 /// Build the list of valid batch start positions: windows of BLOCK_SIZE+1 tokens
 /// that don't cross a document boundary (<|eos|> = token id 1).
-/// Falls back to all positions when no separators are present.
+///
+/// Returns an empty Vec (caller uses random fallback) when:
+/// - no <|eos|> separators exist, OR
+/// - boundaries are sparse enough that <1% of windows are excluded
+///   (avoids building a 200-300MB Vec that is essentially [0..N])
 fn build_valid_starts(data: &[usize]) -> Vec<usize> {
     use crate::config::BLOCK_SIZE;
     if data.len() <= BLOCK_SIZE + 1 {
@@ -49,9 +53,16 @@ fn build_valid_starts(data: &[usize]) -> Vec<usize> {
         .map(|(i, _)| i)
         .collect();
     if eos_positions.is_empty() {
-        return Vec::new(); // no separators — caller falls back to random
+        return Vec::new();
     }
-    (0..data.len() - BLOCK_SIZE - 1)
+    // Each boundary excludes at most BLOCK_SIZE windows. If the total excluded
+    // fraction is <1%, the memory cost of storing valid_starts outweighs the benefit.
+    let max_excluded = eos_positions.len() * BLOCK_SIZE;
+    let total_windows = data.len() - BLOCK_SIZE - 1;
+    if max_excluded * 100 < total_windows {
+        return Vec::new(); // <1% exclusion — not worth 200MB+ allocation
+    }
+    (0..total_windows)
         .filter(|&s| {
             let lo = eos_positions.partition_point(|&p| p < s);
             lo >= eos_positions.len() || eos_positions[lo] >= s + BLOCK_SIZE
