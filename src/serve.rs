@@ -106,7 +106,7 @@ pub fn run_server(
 
         eprintln!("[serve] prompt={:?} max_tokens={} temperature={}", &req.prompt, req.max_tokens, req.temperature);
 
-        let text = generate_cpu(
+        let full_text = generate_cpu(
             model,
             tokenizer,
             &req.prompt,
@@ -116,11 +116,16 @@ pub fn run_server(
             &mut rng,
         );
 
-        let total_tokens = tokenizer.encode(&text).len();
-        let completion_tokens = total_tokens.saturating_sub(prompt_tokens);
+        // generate_cpu returns prompt + completion; strip the prompt prefix
+        let completion = full_text
+            .strip_prefix(&req.prompt)
+            .unwrap_or(&full_text)
+            .to_string();
+
+        let completion_tokens = tokenizer.encode(&completion).len();
 
         let resp = InferResponse {
-            text,
+            text: completion,
             model: model_name.to_string(),
             usage: Usage { prompt_tokens, completion_tokens },
         };
