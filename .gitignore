@@ -8,6 +8,7 @@ Cargo.lock
 data/
 *.txt
 !examples/*.txt
+!spaces/*.txt
 
 # IDE
 .vscode/
