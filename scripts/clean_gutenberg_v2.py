@@ -3,6 +3,7 @@
 clean_gutenberg_v2.py — Improved Gutenberg cleaner.
 
 Changes vs v1:
+  - Excludes known problematic books (Ulysses — extreme stream-of-consciousness)
   - Strips bible/scripture verse references (135:026:010, Gen. 1:1, etc.)
   - Strips lines that are purely numeric / numbering artifacts
   - Strips table of contents / index lines (Chapter I., Act II., etc.)
@@ -10,11 +11,22 @@ Changes vs v1:
   - Strips lines of only punctuation/symbols
   - Strips ALL-CAPS headers/titles (common in plays, legal texts)
   - Strips lines with excessive digit density (page refs, catalogue numbers)
+  - Strips pipe-table lines (| col | col |)
+  - Strips email addresses
+  - Strips /c envelope markers
+  - Strips extended repeated characters (Steeeeeeeee, Frseeeeefronnnng)
+  - Normalises italic stage direction markup [_Exit_] → [Exit]
+  - Strips backtick OCR artifacts (sce`ne → scene)
+  - Normalises tab characters to single space
   - Normalises multiple blank lines to max 2
   - All v1 cleaning retained
 
 Usage:
     python3 scripts/clean_gutenberg_v2.py gutenberg_train.txt train.txt
+
+    # With extra books to replace excluded ones:
+    cat gutenberg_train.txt moby_dick.txt > combined.txt
+    python3 scripts/clean_gutenberg_v2.py combined.txt train.txt
 """
 
 import re
@@ -27,6 +39,11 @@ from pathlib import Path
 
 START_RE = re.compile(r'^\*\*\* START OF (THIS|THE) PROJECT GUTENBERG EBOOK', re.I)
 END_RE   = re.compile(r'^\*\*\* END OF (THIS|THE) PROJECT GUTENBERG EBOOK',   re.I)
+
+# Books to exclude by title substring (matched against first 2000 chars of book)
+EXCLUDED_BOOKS = [
+    "ulysses",          # Joyce — extreme stream-of-consciousness, phonetic artifacts
+]
 
 
 # ── Per-line noise patterns (drop entire line) ────────────────────────────────
@@ -55,7 +72,7 @@ NOISE_PATTERNS = [
     re.compile(r'^\s*[\[\({][0-9a-zA-Z\*†‡§¶]{1,4}[\]\)}]\.?\s*$'),
 
     # ALL-CAPS lines (headers, scene headings, chapter titles in plays)
-    # Only drop if the line is short enough to be a heading (<=60 chars)
+    # Only drop if short enough to be a heading (<=60 chars)
     re.compile(r'^\s*[A-Z][A-Z\s\.\,\-\'\!\?]{4,59}\s*$'),
 
     # Table of contents / index patterns
@@ -63,21 +80,39 @@ NOISE_PATTERNS = [
                r'\s+[IVXLCDM\d]+[\.\s]', re.I),
     re.compile(r'^\s*\d+\.\s+(Chapter|Section|Part|Book)\b', re.I),
 
-    # Lines with excessive digit density: >30% digits = numbering artifact
-    # (evaluated separately in clean_book)
-
     # Trailing page/section refs like "...... 23" or "_________ 7"
     re.compile(r'[\.\-_]{4,}\s*\d+\s*$'),
+
+    # Pipe-table lines: | col | col |
+    re.compile(r'^\s*\|.*\|.*\|\s*$'),
+
+    # Email addresses
+    re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'),
+
+    # /c envelope markers
+    re.compile(r'^\s*/?c/?$'),
+    re.compile(r'^\s*c/\s*$'),
 ]
 
 # Inline patterns: applied to line content (substitution, not full drop)
 INLINE_SUBS = [
-    # Footnote markers inline: [1], [*], {35}
-    (re.compile(r'[\[\({][0-9a-zA-Z\*†‡§¶]{1,4}[\]\)}]'), ''),
+    # Footnote markers inline: [1], [*], {35}  (but NOT stage directions like [Exit])
+    (re.compile(r'[\[\({][0-9\*†‡§¶]{1,4}[\]\)}]'), ''),
     # Scripture refs inline: "see Gen. 3:16" → "see Gen."
     (re.compile(r'\b\d{1,3}:\d{2,3}(:\d{2,3})?'), ''),
     # Gutenberg project references
     (re.compile(r'Project Gutenberg[^\n]{0,80}', re.I), ''),
+    # Italic stage direction markup: [_Exit_] → [Exit], _word_ → word
+    (re.compile(r'\[_(.*?)_\]'), r'[\1]'),
+    (re.compile(r'\b_([\w\s,;:]+?)_\b'), r'\1'),
+    # Backtick OCR artifacts: sce`ne → scene
+    (re.compile(r'`'), ''),
+    # Extended repeated characters: Steeeeeee → Ste, frseeeee → frse
+    (re.compile(r'(.)\1{3,}'), r'\1\1'),
+    # Tab characters → single space
+    (re.compile(r'\t+'), ' '),
+    # Email addresses inline
+    (re.compile(r'\b[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}\b'), ''),
 ]
 
 
@@ -86,6 +121,11 @@ def _digit_density(line: str) -> float:
         return 0.0
     digits = sum(c.isdigit() for c in line)
     return digits / len(line)
+
+
+def _is_excluded(book_text: str) -> bool:
+    sample = book_text[:2000].lower()
+    return any(title in sample for title in EXCLUDED_BOOKS)
 
 
 def extract_books(text: str):
@@ -113,7 +153,7 @@ def clean_book(text: str) -> str:
         if _digit_density(line.strip()) > 0.30 and len(line.strip()) > 3:
             continue
         # Drop noise pattern lines
-        if any(p.match(line) for p in NOISE_PATTERNS):
+        if any(p.search(line) for p in NOISE_PATTERNS):
             continue
         # Apply inline substitutions
         for pattern, replacement in INLINE_SUBS:
@@ -171,6 +211,12 @@ def main():
     print("Extracting books...", file=sys.stderr)
     books = extract_books(text)
     print(f"  Found {len(books)} books", file=sys.stderr)
+
+    print("Filtering excluded books...", file=sys.stderr)
+    before = len(books)
+    books = [b for b in books if not _is_excluded(b)]
+    excluded = before - len(books)
+    print(f"  Excluded {excluded} book(s) ({before} → {len(books)})", file=sys.stderr)
 
     print("Cleaning noise lines (v2)...", file=sys.stderr)
     books = [clean_book(b) for b in books]
