@@ -16,6 +16,7 @@ import torch.nn.functional as F
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import List, Optional
 from huggingface_hub import hf_hub_download
@@ -182,6 +183,13 @@ print("Model ready.")
 
 app = FastAPI(title="randyGPT", version="0.9.6")
 
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
 
 @app.get("/v1/models")
 def list_models():
@@ -210,8 +218,8 @@ class ChatRequest(BaseModel):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
-    # Concatenate messages into a single prompt
-    prompt = "\n".join(m.content for m in req.messages if m.content.strip())
+    # Use last message only (matches MicroJulia behavior)
+    prompt = req.messages[-1].content.strip() if req.messages else ""
     if not prompt:
         raise HTTPException(status_code=400, detail="No content in messages")
 
@@ -219,34 +227,35 @@ def chat_completions(req: ChatRequest):
     if not ids:
         raise HTTPException(status_code=400, detail="Prompt tokenized to empty sequence")
 
-    max_tokens  = min(req.max_tokens or 200, cfg.block_size)
-    temperature = req.temperature or 0.8
+    max_tokens  = max(1, min(req.max_tokens or 200, cfg.block_size))
+    temperature = max(0.01, min(req.temperature or 0.8, 2.0))
     top_p       = req.top_p or 0.9
 
-    tensor  = torch.tensor([ids], dtype=torch.long)
-    out     = model.generate(tensor, max_new_tokens=max_tokens,
-                             temperature=temperature, top_p=top_p)
-    full    = tok.decode(out[0].tolist())
+    tensor = torch.tensor([ids], dtype=torch.long)
+    out    = model.generate(tensor, max_new_tokens=max_tokens,
+                            temperature=temperature, top_p=top_p)
+    full   = tok.decode(out[0].tolist())
     # Strip prompt prefix
     completion = full[len(prompt):].lstrip() if full.startswith(prompt) else full
 
-    prompt_tokens     = len(ids)
     completion_tokens = len(tok.encode(completion))
+    finish_reason     = "length" if completion_tokens >= max_tokens else "stop"
 
     return {
-        "id":      f"chatcmpl-{uuid.uuid4().hex[:8]}",
-        "object":  "chat.completion",
-        "created": int(time.time()),
-        "model":   MODEL_ID,
+        "id":                f"chatcmpl-{uuid.uuid4().hex[:8]}",
+        "object":            "chat.completion",
+        "created":           int(time.time()),
+        "model":             MODEL_ID,
+        "system_fingerprint": f"{MODEL_ID}-v0.9.6",
         "choices": [{
             "index":         0,
             "message":       {"role": "assistant", "content": completion},
-            "finish_reason": "stop",
+            "finish_reason": finish_reason,
         }],
         "usage": {
-            "prompt_tokens":     prompt_tokens,
+            "prompt_tokens":     len(ids),
             "completion_tokens": completion_tokens,
-            "total_tokens":      prompt_tokens + completion_tokens,
+            "total_tokens":      len(ids) + completion_tokens,
         },
     }
 
