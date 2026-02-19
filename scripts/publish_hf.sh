@@ -46,8 +46,18 @@ hf upload "${MODEL_REPO}" "${EXPORT_DIR}" . --repo-type model
 echo ""
 
 # 3. Upload Space files
-echo "[3/3] Uploading Space to ${SPACE_REPO}..."
+echo "[3/4] Uploading Space to ${SPACE_REPO}..."
 hf upload "${SPACE_REPO}" spaces . --repo-type space
+
+echo ""
+
+# 4. Restart Space so it reloads fresh model weights from Hub
+echo "[4/4] Restarting Space..."
+python3 -c "
+from huggingface_hub import HfApi
+HfApi().restart_space('${SPACE_REPO}')
+print('Space restart requested.')
+"
 
 echo ""
 echo "==> Done!"
