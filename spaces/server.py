@@ -15,7 +15,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
@@ -105,6 +105,26 @@ class RandyGPT(nn.Module):
             if nxt.item() == 1:
                 break
         return ids
+
+    @torch.no_grad()
+    def generate_stream(self, ids, max_new_tokens=200, temperature=0.8, top_p=0.9):
+        """Yields (token_id, is_last) one token at a time."""
+        self.eval()
+        for i in range(max_new_tokens):
+            ctx    = ids[:, -self.c.block_size:]
+            logits = self(ctx)[:, -1, :] / max(temperature, 1e-6)
+            probs  = F.softmax(logits, dim=-1)
+            sp, si = torch.sort(probs, descending=True)
+            cum    = sp.cumsum(-1)
+            sp[cum - sp > top_p] = 0.0
+            sp /= sp.sum()
+            nxt = si[0, torch.multinomial(sp[0], 1)]
+            ids = torch.cat([ids, nxt.view(1, 1)], dim=1)
+            token_id = nxt.item()
+            is_last  = (token_id == 1) or (i == max_new_tokens - 1)
+            yield token_id, is_last
+            if token_id == 1:
+                break
 
 
 # ── Tokenizer ─────────────────────────────────────────────────────────────────
@@ -247,34 +267,83 @@ class ChatRequest(BaseModel):
     temperature: Optional[float] = 0.8
     top_p:       Optional[float] = 0.9
     n:           Optional[int]   = 1
+    stream:      Optional[bool]  = False
+
+
+def _sse(data: dict) -> str:
+    return f"data: {json.dumps(data)}\n\n"
+
+
+def _stream_completion(ids, max_tokens, temperature, top_p, completion_id, _model, _tok):
+    """Generator that yields SSE chunks one token at a time.
+    Takes model/tok as arguments (snapshotted at request time) so reloads
+    mid-stream don't affect this request."""
+    tensor      = torch.tensor([ids], dtype=torch.long)
+    token_count = 0
+
+    for token_id, is_last in _model.generate_stream(
+        tensor, max_new_tokens=max_tokens,
+        temperature=temperature, top_p=top_p
+    ):
+        token_text    = _tok.decode([token_id])
+        token_count  += 1
+        finish_reason = ("length" if token_count >= max_tokens else "stop") if is_last else None
+
+        chunk = {
+            "id":      completion_id,
+            "object":  "chat.completion.chunk",
+            "created": int(time.time()),
+            "model":   MODEL_ID,
+            "choices": [{
+                "index": 0,
+                "delta": {"content": token_text},
+                "finish_reason": finish_reason,
+            }],
+        }
+        yield _sse(chunk)
+
+    yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
+    # Snapshot globals at request start — concurrent requests and reloads
+    # are both safe because each request holds its own references.
+    _m, _t, _c = model, tok, cfg
+
     prompt = req.messages[-1].content.strip() if req.messages else ""
     if not prompt:
         raise HTTPException(status_code=400, detail="No content in messages")
 
-    ids = tok.encode(prompt)
+    ids = _t.encode(prompt)
     if not ids:
         raise HTTPException(status_code=400, detail="Prompt tokenized to empty sequence")
 
-    max_tokens  = max(1, min(req.max_tokens or 200, cfg.block_size))
-    temperature = max(0.01, min(req.temperature or 0.8, 2.0))
-    top_p       = req.top_p or 0.9
-    n           = max(1, min(req.n or 1, 4))
+    max_tokens    = max(1, min(req.max_tokens or 200, _c.block_size))
+    temperature   = max(0.01, min(req.temperature or 0.8, 2.0))
+    top_p         = req.top_p or 0.9
+    n             = max(1, min(req.n or 1, 4))
+    completion_id = f"chatcmpl-{uuid.uuid4().hex[:8]}"
 
+    # ── Streaming ─────────────────────────────────────────────────────────────
+    if req.stream:
+        return StreamingResponse(
+            _stream_completion(ids, max_tokens, temperature, top_p, completion_id, _m, _t),
+            media_type="text/event-stream",
+            headers={"X-Accel-Buffering": "no"},
+        )
+
+    # ── Non-streaming ─────────────────────────────────────────────────────────
     choices = []
     total_completion_tokens = 0
 
     for i in range(n):
-        tensor = torch.tensor([ids], dtype=torch.long)
-        with _model_lock:
-            out = model.generate(tensor, max_new_tokens=max_tokens,
-                                 temperature=temperature, top_p=top_p)
-        full       = tok.decode(out[0].tolist())
-        completion = full[len(prompt):].lstrip() if full.startswith(prompt) else full
-        comp_tokens = len(tok.encode(completion))
+        tensor      = torch.tensor([ids], dtype=torch.long)
+        out         = _m.generate(tensor, max_new_tokens=max_tokens,
+                                  temperature=temperature, top_p=top_p)
+        full        = _t.decode(out[0].tolist())
+        completion  = full[len(prompt):].lstrip() if full.startswith(prompt) else full
+        comp_tokens = len(_t.encode(completion))
         total_completion_tokens += comp_tokens
         choices.append({
             "index":         i,
@@ -283,12 +352,12 @@ def chat_completions(req: ChatRequest):
         })
 
     return {
-        "id":                f"chatcmpl-{uuid.uuid4().hex[:8]}",
-        "object":            "chat.completion",
-        "created":           int(time.time()),
-        "model":             MODEL_ID,
+        "id":                 completion_id,
+        "object":             "chat.completion",
+        "created":            int(time.time()),
+        "model":              MODEL_ID,
         "system_fingerprint": f"{MODEL_ID}-v0.9.6",
-        "choices": choices,
+        "choices":            choices,
         "usage": {
             "prompt_tokens":     len(ids),
             "completion_tokens": total_completion_tokens,
