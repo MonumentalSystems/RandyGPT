@@ -168,13 +168,21 @@ import threading
 REPO     = os.environ.get("MODEL_REPO", "MonumentalSystems/randygpt-s")
 MODEL_ID = REPO.split("/")[-1]
 
-_model_lock = threading.Lock()
+_model_lock    = threading.Lock()
+_reload_lock   = threading.Lock()   # only one reload at a time
+_is_reloading  = False              # debounce flag
 
-def load_model():
+def _get_remote_sha() -> str:
+    """Fetch the current commit SHA of model.safetensors from Hub metadata."""
+    from huggingface_hub import get_paths_info
+    infos = list(get_paths_info(REPO, ["model.safetensors"], repo_type="model"))
+    return infos[0].lfs.sha256 if infos and infos[0].lfs else ""
+
+def load_model(force_weights=False):
     print(f"Loading {REPO} …")
-    cfg_path = hf_hub_download(repo_id=REPO, filename="config.json", force_download=False)
-    st_path  = hf_hub_download(repo_id=REPO, filename="model.safetensors", force_download=True)
-    tok_path = hf_hub_download(repo_id=REPO, filename="tokenizer.json", force_download=False)
+    cfg_path = hf_hub_download(repo_id=REPO, filename="config.json",        force_download=False)
+    st_path  = hf_hub_download(repo_id=REPO, filename="model.safetensors",  force_download=force_weights)
+    tok_path = hf_hub_download(repo_id=REPO, filename="tokenizer.json",     force_download=False)
     _cfg  = Cfg(**json.loads(Path(cfg_path).read_text()))
     _tok  = Tokenizer.from_json(tok_path)
     _mdl  = RandyGPT(_cfg)
@@ -184,6 +192,7 @@ def load_model():
     return _cfg, _tok, _mdl
 
 cfg, tok, model = load_model()
+_current_sha = _get_remote_sha()
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -273,11 +282,34 @@ def _do_chat(req: ChatRequest):
 
 @app.post("/reload")
 def reload_weights():
-    """Hot-reload model weights from Hub without restarting the container."""
-    global cfg, tok, model
-    with _model_lock:
-        cfg, tok, model = load_model()
-    return {"status": "ok", "model": MODEL_ID, "reloaded": True}
+    """Hot-reload model weights from Hub. Debounced — returns 200 immediately if already reloading.
+    Only swaps weights if Hub has a newer version of model.safetensors."""
+    global cfg, tok, model, _current_sha, _is_reloading
+
+    # Debounce: if already reloading, return immediately
+    if _is_reloading:
+        return {"status": "ok", "model": MODEL_ID, "reloaded": False, "reason": "already reloading"}
+
+    with _reload_lock:
+        if _is_reloading:
+            return {"status": "ok", "model": MODEL_ID, "reloaded": False, "reason": "already reloading"}
+        _is_reloading = True
+
+    try:
+        new_sha = _get_remote_sha()
+        if new_sha == _current_sha:
+            return {"status": "ok", "model": MODEL_ID, "reloaded": False, "reason": "weights unchanged"}
+
+        print(f"New weights detected ({_current_sha[:8]} → {new_sha[:8]}), reloading…")
+        new_cfg, new_tok, new_model = load_model(force_weights=True)
+
+        with _model_lock:
+            cfg, tok, model = new_cfg, new_tok, new_model
+            _current_sha = new_sha
+
+        return {"status": "ok", "model": MODEL_ID, "reloaded": True, "sha": new_sha[:16]}
+    finally:
+        _is_reloading = False
 
 
 @app.get("/")
