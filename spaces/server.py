@@ -163,21 +163,27 @@ class Tokenizer:
 # ── Load model at startup ──────────────────────────────────────────────────────
 
 import os
-REPO       = os.environ.get("MODEL_REPO", "MonumentalSystems/randygpt-s")
-MODEL_ID   = REPO.split("/")[-1]
+import threading
 
-print(f"Loading {REPO} …")
-cfg_path = hf_hub_download(repo_id=REPO, filename="config.json")
-st_path  = hf_hub_download(repo_id=REPO, filename="model.safetensors")
-tok_path = hf_hub_download(repo_id=REPO, filename="tokenizer.json")
+REPO     = os.environ.get("MODEL_REPO", "MonumentalSystems/randygpt-s")
+MODEL_ID = REPO.split("/")[-1]
 
-_cfg_data = json.loads(Path(cfg_path).read_text())
-cfg  = Cfg(**_cfg_data)
-tok  = Tokenizer.from_json(tok_path)
-model = RandyGPT(cfg)
-model.load_state_dict(load_file(st_path, device="cpu"))
-model.eval()
-print("Model ready.")
+_model_lock = threading.Lock()
+
+def load_model():
+    print(f"Loading {REPO} …")
+    cfg_path = hf_hub_download(repo_id=REPO, filename="config.json", force_download=False)
+    st_path  = hf_hub_download(repo_id=REPO, filename="model.safetensors", force_download=True)
+    tok_path = hf_hub_download(repo_id=REPO, filename="tokenizer.json", force_download=False)
+    _cfg  = Cfg(**json.loads(Path(cfg_path).read_text()))
+    _tok  = Tokenizer.from_json(tok_path)
+    _mdl  = RandyGPT(_cfg)
+    _mdl.load_state_dict(load_file(st_path, device="cpu"))
+    _mdl.eval()
+    print("Model ready.")
+    return _cfg, _tok, _mdl
+
+cfg, tok, model = load_model()
 
 
 # ── FastAPI app ────────────────────────────────────────────────────────────────
@@ -219,6 +225,10 @@ class ChatRequest(BaseModel):
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
+    with _model_lock:
+        return _do_chat(req)
+
+def _do_chat(req: ChatRequest):
     # Use last message only (matches MicroJulia behavior)
     prompt = req.messages[-1].content.strip() if req.messages else ""
     if not prompt:
@@ -261,6 +271,15 @@ def chat_completions(req: ChatRequest):
     }
 
 
+@app.post("/reload")
+def reload_weights():
+    """Hot-reload model weights from Hub without restarting the container."""
+    global cfg, tok, model
+    with _model_lock:
+        cfg, tok, model = load_model()
+    return {"status": "ok", "model": MODEL_ID, "reloaded": True}
+
+
 @app.get("/")
 def root():
-    return {"model": MODEL_ID, "endpoints": ["/v1/models", "/v1/chat/completions"]}
+    return {"model": MODEL_ID, "endpoints": ["/v1/models", "/v1/chat/completions", "/reload"]}
