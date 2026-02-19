@@ -58,19 +58,13 @@ hf upload "${SPACE_REPO}" spaces . --repo-type space
 
 echo ""
 
-# 4. Hot-reload weights via /reload endpoint (falls back to container restart)
-echo "[4/4] Reloading model weights..."
-SPACE_URL="https://$(echo ${SPACE_REPO} | tr '/' '-' | tr '[:upper:]' '[:lower:]').hf.space"
-if curl -sf -X POST "${SPACE_URL}/reload" -o /dev/null 2>/dev/null; then
-    echo "Hot-reload successful: ${SPACE_URL}/reload"
-else
-    echo "Space not responding, falling back to container restart..."
-    python3 -c "
+# 4. Restart container (picks up new code + fresh weights on startup)
+echo "[4/4] Restarting Space container..."
+python3 -c "
 from huggingface_hub import HfApi
 HfApi().restart_space('${SPACE_REPO}')
 print('Space restart requested.')
 "
-fi
 
 echo ""
 echo "==> Done!"
