@@ -17,6 +17,7 @@ from pathlib import Path
 from fastapi import FastAPI, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
 from pydantic import BaseModel
 from typing import List, Optional
 from huggingface_hub import hf_hub_download
@@ -206,6 +207,21 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+def _openai_error(status: int, message: str, err_type: str = "invalid_request_error", code: str = None):
+    body = {"error": {"message": message, "type": err_type}}
+    if code:
+        body["error"]["code"] = code
+    return JSONResponse(status_code=status, content=body)
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    return _openai_error(exc.status_code, str(exc.detail))
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    msg = "; ".join(f"{e['loc'][-1]}: {e['msg']}" for e in exc.errors())
+    return _openai_error(422, msg, code="invalid_request_error")
+
 
 @app.get("/v1/models")
 def list_models():
@@ -225,20 +241,16 @@ class Message(BaseModel):
     content: str
 
 class ChatRequest(BaseModel):
-    model:       Optional[str]  = MODEL_ID
+    model:       Optional[str]   = MODEL_ID
     messages:    List[Message]
-    max_tokens:  Optional[int]  = 200
+    max_tokens:  Optional[int]   = 200
     temperature: Optional[float] = 0.8
     top_p:       Optional[float] = 0.9
+    n:           Optional[int]   = 1
 
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatRequest):
-    with _model_lock:
-        return _do_chat(req)
-
-def _do_chat(req: ChatRequest):
-    # Use last message only (matches MicroJulia behavior)
     prompt = req.messages[-1].content.strip() if req.messages else ""
     if not prompt:
         raise HTTPException(status_code=400, detail="No content in messages")
@@ -250,16 +262,25 @@ def _do_chat(req: ChatRequest):
     max_tokens  = max(1, min(req.max_tokens or 200, cfg.block_size))
     temperature = max(0.01, min(req.temperature or 0.8, 2.0))
     top_p       = req.top_p or 0.9
+    n           = max(1, min(req.n or 1, 4))
 
-    tensor = torch.tensor([ids], dtype=torch.long)
-    out    = model.generate(tensor, max_new_tokens=max_tokens,
-                            temperature=temperature, top_p=top_p)
-    full   = tok.decode(out[0].tolist())
-    # Strip prompt prefix
-    completion = full[len(prompt):].lstrip() if full.startswith(prompt) else full
+    choices = []
+    total_completion_tokens = 0
 
-    completion_tokens = len(tok.encode(completion))
-    finish_reason     = "length" if completion_tokens >= max_tokens else "stop"
+    for i in range(n):
+        tensor = torch.tensor([ids], dtype=torch.long)
+        with _model_lock:
+            out = model.generate(tensor, max_new_tokens=max_tokens,
+                                 temperature=temperature, top_p=top_p)
+        full       = tok.decode(out[0].tolist())
+        completion = full[len(prompt):].lstrip() if full.startswith(prompt) else full
+        comp_tokens = len(tok.encode(completion))
+        total_completion_tokens += comp_tokens
+        choices.append({
+            "index":         i,
+            "message":       {"role": "assistant", "content": completion},
+            "finish_reason": "length" if comp_tokens >= max_tokens else "stop",
+        })
 
     return {
         "id":                f"chatcmpl-{uuid.uuid4().hex[:8]}",
@@ -267,15 +288,11 @@ def _do_chat(req: ChatRequest):
         "created":           int(time.time()),
         "model":             MODEL_ID,
         "system_fingerprint": f"{MODEL_ID}-v0.9.6",
-        "choices": [{
-            "index":         0,
-            "message":       {"role": "assistant", "content": completion},
-            "finish_reason": finish_reason,
-        }],
+        "choices": choices,
         "usage": {
             "prompt_tokens":     len(ids),
-            "completion_tokens": completion_tokens,
-            "total_tokens":      len(ids) + completion_tokens,
+            "completion_tokens": total_completion_tokens,
+            "total_tokens":      len(ids) + total_completion_tokens,
         },
     }
 
