@@ -21,6 +21,7 @@ A GPT-style language model implemented from scratch in Rust. Training runs on Me
 |--------|-----|-------|--------|--------|------------|
 | model-xs | 116 | 4 | 3 | ~746K | `--features model-xs` |
 | **model-s** | **128** | **4** | **8** | **~1.6M** | `--features model-s` |
+| model-ds *(deep-s)* | 128 | 4 | 12 | ~2.78M | `--features model-ds` |
 | model-m | 192 | 6 | 6 | ~2.7M | `--features model-m` |
 | model-l *(default)* | 256 | 8 | 6 | ~4.82M | *(none)* |
 | model-deep | 192 | 6 | 16 | ~7.5M | `--features model-deep` |
@@ -198,6 +199,8 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] Best checkpoint flushed to disk immediately on val loss improvement (v0.9.6)
 - [x] HuggingFace export — safetensors + PyTorch modeling + tokenizer scripts (v0.9.6)
 - [x] HuggingFace Space — Gradio UI loading model from Hub (v0.9.6)
+- [x] model-ds preset — 128-dim, 4-head, 12-layer (~2.78M params, deep-s) (v0.9.6)
+- [x] Per-model HF Spaces via MODEL_REPO env var (v0.9.6)
 
 ## HuggingFace Export & Deployment
 

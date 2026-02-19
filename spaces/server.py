@@ -162,8 +162,9 @@ class Tokenizer:
 
 # ── Load model at startup ──────────────────────────────────────────────────────
 
-REPO       = "MonumentalSystems/randygpt-s"
-MODEL_ID   = "randygpt-s"
+import os
+REPO       = os.environ.get("MODEL_REPO", "MonumentalSystems/randygpt-s")
+MODEL_ID   = REPO.split("/")[-1]
 
 print(f"Loading {REPO} …")
 cfg_path = hf_hub_download(repo_id=REPO, filename="config.json")

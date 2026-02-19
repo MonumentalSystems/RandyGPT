@@ -3,11 +3,12 @@
 /* ------------------------------------------------------------------ */
 //
 // Model size presets — select at build time with:
-//   cargo build --release --features model-xs    (~746K params)  — 116-dim, 4-head, 3-layer
-//   cargo build --release --features model-s     (~1.6M params)  — 128-dim, 4-head, 8-layer
+//   cargo build --release --features model-xs    (~746K params)   — 116-dim, 4-head,  3-layer
+//   cargo build --release --features model-s     (~1.6M params)   — 128-dim, 4-head,  8-layer
+//   cargo build --release --features model-ds    (~2.78M params)  — 128-dim, 4-head, 12-layer (deep-s)
 //   cargo build --release --features model-m     (~2.7M params, ~1100ms/iter)
 //   cargo build --release --features model-l     (~4.82M params, ~1835ms/iter)  ← default
-//   cargo build --release --features model-deep  (~7.5M params)  — 192-dim, 6-head, 16-layer
+//   cargo build --release --features model-deep  (~7.5M params)   — 192-dim, 6-head, 16-layer
 //   cargo build --release --features model-xl    (~10.8M params, ~4000ms/iter)
 //
 // All presets use BLOCK_SIZE=256; BATCH_SIZE varies per model.
@@ -28,6 +29,13 @@ pub const N_EMBD:  usize = 128;
 pub const N_HEAD:  usize = 4;
 #[cfg(feature = "model-s")]
 pub const N_LAYER: usize = 8;
+
+#[cfg(feature = "model-ds")]
+pub const N_EMBD:  usize = 128;
+#[cfg(feature = "model-ds")]
+pub const N_HEAD:  usize = 4;
+#[cfg(feature = "model-ds")]
+pub const N_LAYER: usize = 12;
 
 #[cfg(feature = "model-m")]
 pub const N_EMBD:  usize = 192;
@@ -51,11 +59,11 @@ pub const N_HEAD:  usize = 8;
 pub const N_LAYER: usize = 8;
 
 // Default (model-l): 256-dim, 8-head, 6-layer — ~4.82M params
-#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
+#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-ds", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
 pub const N_EMBD:  usize = 256;
-#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
+#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-ds", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
 pub const N_HEAD:  usize = 8;
-#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
+#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-ds", feature = "model-m", feature = "model-deep", feature = "model-xl")))]
 pub const N_LAYER: usize = 6;
 
 pub const BLOCK_SIZE: usize = 256;
@@ -74,11 +82,13 @@ pub const BPE_VOCAB_PATH: &str  = "vocab.json";
 pub const BATCH_SIZE: usize = 64;
 #[cfg(feature = "model-s")]
 pub const BATCH_SIZE: usize = 64;
+#[cfg(feature = "model-ds")]
+pub const BATCH_SIZE: usize = 64;
 #[cfg(feature = "model-m")]
 pub const BATCH_SIZE: usize = 64;
 #[cfg(feature = "model-deep")]
 pub const BATCH_SIZE: usize = 16;
-#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-m", feature = "model-deep")))]
+#[cfg(not(any(feature = "model-xs", feature = "model-s", feature = "model-ds", feature = "model-m", feature = "model-deep")))]
 pub const BATCH_SIZE: usize = 64;
 
 // Gradient accumulation — kept at 1 for all models.

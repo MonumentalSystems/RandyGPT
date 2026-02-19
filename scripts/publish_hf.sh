@@ -17,7 +17,7 @@ set -euo pipefail
 MODEL_SIZE="${1:-s}"
 CHECKPOINT="${2:-checkpoint_best.bin}"
 MODEL_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}"
-SPACE_REPO="MonumentalSystems/randygpt-space"
+SPACE_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}-space"
 EXPORT_DIR="hf_export"
 VOCAB="vocab.json"
 
@@ -45,8 +45,15 @@ hf upload "${MODEL_REPO}" "${EXPORT_DIR}" . --repo-type model
 
 echo ""
 
-# 3. Upload Space files
+# 3. Upload Space files (create space if it doesn't exist)
 echo "[3/4] Uploading Space to ${SPACE_REPO}..."
+hf repo create "${SPACE_REPO}" --repo-type space --space-sdk docker --exist-ok
+# Inject MODEL_REPO env var into Space metadata
+python3 -c "
+from huggingface_hub import HfApi
+HfApi().add_space_variable('${SPACE_REPO}', 'MODEL_REPO', '${MODEL_REPO}')
+print('Set MODEL_REPO=${MODEL_REPO}')
+"
 hf upload "${SPACE_REPO}" spaces . --repo-type space
 
 echo ""
