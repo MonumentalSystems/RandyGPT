@@ -6,6 +6,7 @@ mod model;
 mod ops;
 mod optimizer;
 mod rng;
+mod serve;
 mod tokenizer;
 mod train;
 
@@ -45,6 +46,9 @@ fn main() -> std::io::Result<()> {
     let mut bpe_vocab_size:  Option<usize> = None;
     let mut generate_mode:   bool = false;
     let mut generate_prompts: Vec<String> = Vec::new();
+    let mut serve_mode:      bool = false;
+    let mut serve_addr:      Option<String> = None;
+    let mut api_key:         Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -93,6 +97,23 @@ fn main() -> std::io::Result<()> {
                     generate_prompts.push(args[i].clone());
                 }
             }
+            "--serve" => {
+                // --serve               → listen on 0.0.0.0:8080
+                // --serve 127.0.0.1:9000 → listen on custom address
+                serve_mode = true;
+                if i + 1 < args.len() && !args[i + 1].starts_with("--") {
+                    i += 1;
+                    serve_addr = Some(args[i].clone());
+                } else {
+                    serve_addr = Some("0.0.0.0:8080".to_string());
+                }
+            }
+            "--api-key" => {
+                i += 1;
+                if i < args.len() {
+                    api_key = Some(args[i].clone());
+                }
+            }
             other => {
                 if let Ok(n) = other.parse::<usize>() {
                     iterations = n;
@@ -114,6 +135,18 @@ fn main() -> std::io::Result<()> {
             resume_path = Some("checkpoint.bin".to_string());
         } else {
             eprintln!("Error: --generate requires a checkpoint file. Train first or specify --resume <path>.");
+            return Ok(());
+        }
+    }
+
+    // --serve implies --resume if no explicit --resume given
+    if serve_mode && resume_path.is_none() {
+        if Path::new("checkpoint_best.bin").exists() {
+            resume_path = Some("checkpoint_best.bin".to_string());
+        } else if Path::new("checkpoint.bin").exists() {
+            resume_path = Some("checkpoint.bin".to_string());
+        } else {
+            eprintln!("Error: --serve requires a checkpoint file. Train first or specify --resume <path>.");
             return Ok(());
         }
     }
@@ -194,6 +227,58 @@ fn main() -> std::io::Result<()> {
             println!("{}", sample);
             println!();
         }
+        return Ok(());
+    }
+
+    // ── Serve mode: load tokenizer + model, run HTTP server ─────────────
+    if serve_mode {
+        let addr = serve_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string());
+
+        let tokenizer = if let Some(_target) = bpe_vocab_size {
+            if Path::new(BPE_VOCAB_PATH).exists() {
+                println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
+                let t = Tokenizer::load_bpe(BPE_VOCAB_PATH)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                println!("Loaded BPE vocab ({} tokens)", t.vocab_size);
+                t
+            } else {
+                return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                    "No vocab.json found. Train first or specify --bpe."));
+            }
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::Other,
+                "--serve requires BPE mode (--bpe N). Use --bpe with a trained vocab.json."));
+        };
+
+        println!("Vocabulary size: {}", tokenizer.vocab_size);
+        println!();
+
+        let mut model = GPTModel::new(tokenizer.vocab_size, &mut rng);
+        let param_count = model.wte.len() + model.wpe.len() + model.lm_head.len()
+            + N_LAYER * (
+                model.layers[0].wq.len() + model.layers[0].wk.len()
+                + model.layers[0].wv.len() + model.layers[0].wo.len()
+                + model.layers[0].fc1.len() + model.layers[0].fc2.len()
+            );
+        println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
+
+        if let Some(ref path) = resume_path {
+            println!("Loading checkpoint: {}...", path);
+            load_checkpoint_cpu(path, &mut model)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        } else {
+            return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
+                "No checkpoint found for --serve. Train a model first."));
+        }
+
+        let model_name = format!("randygpt-{}L-{}H-{}D", N_LAYER, N_HEAD, N_EMBD);
+
+        ctrlc::set_handler(|| {
+            println!("\nServer stopped.");
+            std::process::exit(0);
+        }).ok();
+
+        serve::run_server(&addr, &model, &tokenizer, &model_name, api_key.as_deref());
         return Ok(());
     }
 

@@ -17,7 +17,7 @@ cargo build --release
 ## CLI Arguments
 
 ```
-./randygpt [--iters N] [--resume [path]]
+./randygpt [--iters N] [--resume [path]] [--generate PROMPT] [--bpe [N]] [--serve [addr]] [--api-key KEY]
 ```
 
 | Flag | Default | Description |
@@ -25,6 +25,12 @@ cargo build --release
 | `--iters N` | 1000 | Total iterations to train to (not additional — the target) |
 | `--resume` | — | Resume from `checkpoint.bin` (auto path) |
 | `--resume <path>` | — | Resume from a specific `.bin` file |
+| `--generate PROMPT` | — | CPU-only inference; skips data loading and Metal init |
+| `--bpe [N]` | — | Use BPE tokenization with vocab size N (default 2000) |
+| `--serve [addr]` | `0.0.0.0:8080` | Start HTTP inference server; requires `--bpe` and a checkpoint |
+| `--api-key KEY` | — | Require `Authorization: Bearer KEY` on all `/` requests |
+| `--lr LR` | — | Override learning rate at runtime |
+| `--min-lr LR` | — | Override minimum learning rate at runtime |
 
 ### Examples
 
@@ -43,6 +49,70 @@ cargo build --release
 ```
 
 > **Note**: `--iters` is a *target*, not an *additional count*. If you trained to 1000 and want 500 more, pass `--iters 1500`.
+
+## Serve Mode
+
+`--serve` loads a trained checkpoint and starts a lightweight HTTP server for on-demand generation. It requires BPE mode (`--bpe`) and a checkpoint.
+
+```bash
+# Default address (0.0.0.0:8080) — auto-loads checkpoint_best.bin or checkpoint.bin
+./target/release/randygpt --bpe --serve
+
+# Custom address
+./target/release/randygpt --bpe --serve 127.0.0.1:9000
+
+# With bearer-token auth
+./target/release/randygpt --bpe --serve --api-key mysecret
+
+# Explicit checkpoint
+./target/release/randygpt --bpe --resume runs/my_run.bin --serve
+```
+
+### Request format
+
+`POST /` with a JSON body:
+
+```json
+{
+  "prompt": "Once upon a time",
+  "max_tokens": 200,
+  "temperature": 0.8
+}
+```
+
+`max_tokens` and `temperature` are optional (defaults: 2048 and 0.7).
+
+### Response format
+
+```json
+{
+  "text": "Once upon a time in a land far away...",
+  "model": "randygpt-6L-8H-256D",
+  "usage": {
+    "prompt_tokens": 4,
+    "completion_tokens": 196
+  }
+}
+```
+
+### Authentication
+
+If `--api-key` is provided, every request must include:
+```
+Authorization: Bearer <key>
+```
+Requests without or with a wrong token receive `401 Unauthorized`.
+
+### Example
+
+```bash
+curl -s http://localhost:8080/ \
+  -H 'Content-Type: application/json' \
+  -H 'Authorization: Bearer mysecret' \
+  -d '{"prompt":"ROMEO:","max_tokens":100,"temperature":0.9}'
+```
+
+Press **Ctrl-C** to stop the server cleanly.
 
 ## Checkpoints
 

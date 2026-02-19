@@ -4,27 +4,28 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 | v0.9.2 |
-|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M | ~4.82M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** | same |
-| **Tokenizer** | char | char | char | char | char | char | char | char | char | char | char | **char + BPE** |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** | ✅ RGPT0003 |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** | ✅ val-based |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 |
-| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** |
-| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | **87.1** (BPE†) |
-| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 | v0.9.2 | v0.9.4 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 | 256 | 256 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M | ~4.82M | ~4.82M |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** | same | same |
+| **Tokenizer** | char | char | char | char | char | char | char | char | char | char | char | **char + BPE** | **char + BPE** |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** | ✅ RGPT0003 | ✅ RGPT0003 |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** | ✅ val-based | ✅ val-based |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
+| **HTTP server** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **--serve** |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 | 64 |
+| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** | **256** |
+| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | **87.1** (BPE†) | same |
+| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 | ~1870 |
 
 †RSS ~1GB real at T=256; Activity Monitor shows 4-8GB (Metal unified memory pool — not CPU-resident)
 ‡Estimated
@@ -32,6 +33,52 @@ All notable changes to randyGPT are documented here.
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
 †BPE ppl 87.1 ≈ char-equiv ppl ~1.7 — not directly comparable to char-level ppl (see v0.9.2 notes)
+
+---
+
+## [0.9.4] - 2026-02-18
+
+### HTTP Inference Server (`--serve`)
+
+#### New `src/serve.rs` Module
+- `run_server(addr, model, tokenizer, model_name, api_key)` — single-threaded HTTP server using `tiny_http`
+- Accepts `POST /` with JSON body `{prompt, max_tokens, temperature}` (last two optional, defaults 2048 / 0.7)
+- Returns JSON `{text, model, usage: {prompt_tokens, completion_tokens}}`
+- Optional bearer-token auth: if `--api-key KEY` is passed, requests without `Authorization: Bearer KEY` receive `401 Unauthorized`
+- RNG seeded from subsecond system clock per request for variety without a stateful seed
+
+#### `--serve [addr]` CLI Flag
+- Starts the inference server instead of training; incompatible with `--iters`
+- Default listen address: `0.0.0.0:8080`; override with `--serve 127.0.0.1:9000`
+- Requires BPE mode (`--bpe`): loads `vocab.json` before starting
+- Auto-discovers checkpoint on startup: tries `checkpoint_best.bin` then `checkpoint.bin` (same logic as `--generate`)
+- Explicit checkpoint still supported via `--resume <path> --serve`
+- Ctrl-C handler shuts down cleanly via `std::process::exit(0)`
+
+#### `--api-key KEY` CLI Flag
+- Optional; passed through to `run_server` as `Option<&str>`
+- Validated against `Authorization` header on every request
+
+#### Dependencies
+- Added `tiny_http = "0.12"` to `Cargo.toml`
+
+#### Usage
+
+```bash
+# Default address, auto-load best checkpoint
+./target/release/randygpt --bpe --serve
+
+# Custom address
+./target/release/randygpt --bpe --serve 127.0.0.1:9000
+
+# With auth
+./target/release/randygpt --bpe --serve --api-key mysecret
+
+# Test
+curl -s http://localhost:8080/ \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"ROMEO:","max_tokens":100,"temperature":0.9}'
+```
 
 ---
 

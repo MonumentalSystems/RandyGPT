@@ -10,9 +10,10 @@ A GPT-style language model implemented from scratch in Rust. Training runs on Me
 - **Full Training Loop**: AdamW optimizer, gradient clipping, dropout, LR warmup + cosine decay
 - **GPT-2 Style Init**: Scaled output projections for stable deep training
 - **Checkpoint Save/Resume**: RGPT0002 format; save and continue across sessions
-- **Character-Level Tokenization**: Up to 512-char vocabulary with BOS/EOS tokens
+- **Character-Level + BPE Tokenization**: char vocab or learned BPE with `--bpe [N]`
 - **KV Cache**: Efficient autoregressive generation
 - **Top-P + Temperature Sampling**: Nucleus sampling for text generation
+- **HTTP Inference Server**: `--serve` flag exposes a POST endpoint for on-demand generation
 
 ## Current Model Configuration (v0.8.0)
 
@@ -54,6 +55,36 @@ cargo build --release
 # Resume from a specific file
 ./target/release/randygpt --iters 5000 --resume my_run.bin
 ```
+
+### Run inference server
+
+```bash
+# Serve on default address (0.0.0.0:8080) — auto-loads checkpoint_best.bin
+./target/release/randygpt --bpe --serve
+
+# Custom address
+./target/release/randygpt --bpe --serve 127.0.0.1:9000
+
+# With bearer-token authentication
+./target/release/randygpt --bpe --serve --api-key mysecret
+```
+
+The server accepts `POST /` with a JSON body and returns generated text:
+
+```bash
+curl -s http://localhost:8080/ \
+  -H 'Content-Type: application/json' \
+  -d '{"prompt":"Once upon a time","max_tokens":200,"temperature":0.8}'
+# → {"text":"…","model":"randygpt-6L-8H-256D","usage":{"prompt_tokens":4,"completion_tokens":196}}
+```
+
+| Field | Default | Description |
+|-------|---------|-------------|
+| `prompt` | required | Text prompt |
+| `max_tokens` | 2048 | Maximum tokens to generate |
+| `temperature` | 0.7 | Sampling temperature |
+
+If `--api-key` is set, every request must include `Authorization: Bearer <key>`.
 
 ### Checkpoint files
 
@@ -138,6 +169,9 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] Accelerate BLAS for CPU matmuls (v0.7.0)
 - [x] SGEMM batched backward, 256-dim, batch=128 (v0.7.1)
 - [x] Metal GPU training via Candle autograd (v0.8.0)
+- [x] BPE tokenization with `--bpe [N]` flag (v0.9.2)
+- [x] Fast CPU-only `--generate` mode (v0.9.3)
+- [x] HTTP inference server via `--serve` (v0.9.4)
 
 ## Credits
 
