@@ -2,20 +2,23 @@
 # publish_hf.sh — Export checkpoint and push to HuggingFace Hub + Space
 #
 # Usage:
-#   ./scripts/publish_hf.sh [model-size] [checkpoint]
+#   ./scripts/publish_hf.sh [model-size] [checkpoint] [--restart]
 #
-#   model-size  xs/s/m/l/deep/xl  (default: s)
-#   checkpoint  path to .bin file  (default: checkpoint_best.bin)
+#   model-size  xs/s/m/l/ds/deep/xl  (default: s)
+#   checkpoint  path to .bin file    (default: checkpoint_best.bin)
+#   --restart   force full container restart instead of hot-reload
 #
 # Examples:
-#   ./scripts/publish_hf.sh
-#   ./scripts/publish_hf.sh s checkpoint_best.bin
-#   ./scripts/publish_hf.sh m checkpoint.bin
+#   ./scripts/publish_hf.sh                              # weights only, hot-reload
+#   ./scripts/publish_hf.sh s checkpoint_best.bin        # weights only, hot-reload
+#   ./scripts/publish_hf.sh s checkpoint_best.bin --restart  # force restart
 
 set -euo pipefail
 
 MODEL_SIZE="${1:-s}"
 CHECKPOINT="${2:-checkpoint_best.bin}"
+FORCE_RESTART=false
+for arg in "$@"; do [[ "$arg" == "--restart" ]] && FORCE_RESTART=true; done
 MODEL_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}"
 SPACE_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}-space"
 EXPORT_DIR="hf_export"
@@ -54,17 +57,37 @@ from huggingface_hub import HfApi
 HfApi().add_space_variable('${SPACE_REPO}', 'MODEL_REPO', '${MODEL_REPO}')
 print('Set MODEL_REPO=${MODEL_REPO}')
 "
-hf upload "${SPACE_REPO}" spaces . --repo-type space
+SPACE_UPLOAD_OUT=$(hf upload "${SPACE_REPO}" spaces . --repo-type space 2>&1)
+echo "${SPACE_UPLOAD_OUT}"
+SPACE_FILES_CHANGED=true
+if echo "${SPACE_UPLOAD_OUT}" | grep -q "No files have been modified"; then
+    SPACE_FILES_CHANGED=false
+fi
 
 echo ""
 
-# 4. Restart container (picks up new code + fresh weights on startup)
-echo "[4/4] Restarting Space container..."
-python3 -c "
+# 4. Restart or hot-reload depending on whether Space code changed
+SPACE_URL="https://$(echo ${SPACE_REPO} | tr '/' '-' | tr '[:upper:]' '[:lower:]').hf.space"
+if [ "${FORCE_RESTART}" = true ] || [ "${SPACE_FILES_CHANGED}" = true ]; then
+    echo "[4/4] Space code changed — restarting container..."
+    python3 -c "
 from huggingface_hub import HfApi
 HfApi().restart_space('${SPACE_REPO}')
 print('Space restart requested.')
 "
+else
+    echo "[4/4] Space code unchanged — hot-reloading weights..."
+    if curl -sf -X POST "${SPACE_URL}/reload" -o /dev/null 2>/dev/null; then
+        echo "Hot-reload successful."
+    else
+        echo "Space not responding, falling back to restart..."
+        python3 -c "
+from huggingface_hub import HfApi
+HfApi().restart_space('${SPACE_REPO}')
+print('Space restart requested.')
+"
+    fi
+fi
 
 echo ""
 echo "==> Done!"
