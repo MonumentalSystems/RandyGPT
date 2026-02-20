@@ -2,27 +2,34 @@
 # publish_hf.sh — Export checkpoint and push to HuggingFace Hub + Space
 #
 # Usage:
-#   ./scripts/publish_hf.sh [model-size] [checkpoint] [--restart]
+#   ./scripts/publish_hf.sh [model-size] [checkpoint] [--vocab vocab.json] [--restart]
 #
-#   model-size  xs/s/m/l/ds/deep/xl  (default: s)
-#   checkpoint  path to .bin file    (default: checkpoint_best.bin)
+#   model-size  xs/s/s2/ds/m/l/deep/xl  (default: xs)
+#   checkpoint  path to .bin file        (default: checkpoint_best.bin)
+#   --vocab     vocab json path          (default: vocab.json)
 #   --restart   force full container restart instead of hot-reload
 #
 # Examples:
-#   ./scripts/publish_hf.sh                              # weights only, hot-reload
-#   ./scripts/publish_hf.sh s checkpoint_best.bin        # weights only, hot-reload
-#   ./scripts/publish_hf.sh s checkpoint_best.bin --restart  # force restart
+#   ./scripts/publish_hf.sh                                         # xs, hot-reload
+#   ./scripts/publish_hf.sh ds checkpoint_ds_best.bin               # ds model
+#   ./scripts/publish_hf.sh ds checkpoint_rust_ft_best.bin --restart # fine-tuned rust
 
 set -euo pipefail
 
-MODEL_SIZE="${1:-s}"
+MODEL_SIZE="${1:-xs}"
 CHECKPOINT="${2:-checkpoint_best.bin}"
 FORCE_RESTART=false
-for arg in "$@"; do [[ "$arg" == "--restart" ]] && FORCE_RESTART=true; done
+VOCAB="vocab.json"
+args=("$@")
+for ((i=0; i<${#args[@]}; i++)); do
+    case "${args[$i]}" in
+        --restart) FORCE_RESTART=true ;;
+        --vocab)   VOCAB="${args[$((i+1))]}"; ((i++)) ;;
+    esac
+done
 MODEL_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}"
 SPACE_REPO="MonumentalSystems/randygpt-${MODEL_SIZE}-space"
 EXPORT_DIR="hf_export"
-VOCAB="vocab.json"
 
 echo "==> randyGPT publish"
 echo "    checkpoint : ${CHECKPOINT}"
