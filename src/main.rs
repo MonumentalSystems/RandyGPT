@@ -644,7 +644,16 @@ fn main() -> std::io::Result<()> {
     if use_metal {
         let device = METAL_DEVICE.as_ref().unwrap();
         let (mut candle_model, mut opt) = if let Some((cm, o, _, _, _)) = candle_resume {
-            (cm, o)
+            if fine_tune {
+                // Keep weights, discard moments — stale Gutenberg moments cause NaN on new domain
+                let vars = cm.all_vars();
+                let fresh_opt = GpuAdamState::new(&vars)
+                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                println!("Fine-tune: optimizer moments reset to zero.");
+                (cm, fresh_opt)
+            } else {
+                (cm, o)
+            }
         } else {
             let cm = CandleModel::from_gpt(&model, device)
                 .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
