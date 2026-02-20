@@ -101,7 +101,7 @@ fn generate_inner(
     _force_cpu: bool,
 ) -> String {
     let mut tokens = tokenizer.encode(prompt);
-    let max_len = BLOCK_SIZE.min(tokens.len() + max_new_tokens);
+    let max_len = tokens.len() + max_new_tokens;
 
     // Helper: sample the next token from a logits vector using top-p (nucleus) sampling.
     let sample = |logits: &[f32], probs: &mut Vec<f32>, rng: &mut Rng| -> usize {

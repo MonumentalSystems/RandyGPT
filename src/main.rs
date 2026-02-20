@@ -88,6 +88,9 @@ fn main() -> std::io::Result<()> {
     let mut vocab_path:              String = BPE_VOCAB_PATH.to_string();
     let mut checkpoint_prefix_arg:   Option<String> = None;
     let mut fine_tune:               bool = false;
+    let mut gen_max_tokens:         usize = 200;
+    let mut gen_temperature:         f32  = 0.8;
+    let mut gen_top_k:               f32  = 0.9;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -174,6 +177,24 @@ fn main() -> std::io::Result<()> {
                 }
             }
             "--fine-tune" => { fine_tune = true; }
+            "--max-tokens" => {
+                i += 1;
+                if i < args.len() {
+                    gen_max_tokens = args[i].parse().unwrap_or(200);
+                }
+            }
+            "--temperature" => {
+                i += 1;
+                if i < args.len() {
+                    gen_temperature = args[i].parse().unwrap_or(0.8);
+                }
+            }
+            "--top-k" => {
+                i += 1;
+                if i < args.len() {
+                    gen_top_k = args[i].parse().unwrap_or(0.9);
+                }
+            }
             "--help" | "-h" => {
                 println!("randyGPT — tiny GPT language model\n");
                 println!("USAGE:");
@@ -190,6 +211,9 @@ fn main() -> std::io::Result<()> {
                 println!("  --min-lr LR        Minimum learning rate override\n");
                 println!("INFERENCE:");
                 println!("  --generate [PROMPT...]  Generate text from checkpoint");
+                println!("  --max-tokens N          Tokens to generate per prompt (default: 200)");
+                println!("  --temperature F         Sampling temperature (default: 0.8, lower=focused)");
+                println!("  --top-k F               Top-k cumulative probability cutoff (default: 0.9)");
                 println!("  --serve [ADDR]          Start HTTP server (default: 0.0.0.0:8080)");
                 println!("  --api-key KEY           API key for server auth\n");
                 println!("EXAMPLES:");
@@ -338,7 +362,7 @@ fn main() -> std::io::Result<()> {
             println!("────────────────────────────────────");
             println!("Prompt: \"{}\"", prompt);
             println!("────────────────────────────────────");
-            let sample = generate_cpu(&model, &tokenizer, prompt, 200, 0.8, 0.9, &mut rng);
+            let sample = generate_cpu(&model, &tokenizer, prompt, gen_max_tokens, gen_temperature, gen_top_k, &mut rng);
             println!("{}", sample);
             println!();
         }

@@ -266,7 +266,7 @@ pub fn forward_candle_train(
     tokens:  &Tensor,
     targets: &Tensor,
     model:   &CandleModel,
-    _training: bool,
+    training: bool,
 ) -> CResult<Tensor> {
     let device = &model.device;
     let (batch, seq_len) = tokens.dims2()?;
@@ -330,6 +330,7 @@ pub fn forward_candle_train(
         // Output projection + residual: flatten → matmul → reshape → add
         let attn_2d = attn_out.reshape((batch * seq_len, N_EMBD))?;
         let proj = attn_2d.matmul(&layer.wo.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let proj = if training { candle_nn::ops::dropout(&proj, DROPOUT_RATE)? } else { proj };
         x = (x + proj)?;                                              // residual
 
         // MLP pre-norm
@@ -347,6 +348,7 @@ pub fn forward_candle_train(
         let h2  = h1r.mul(&h1r)?;                                     // squared ReLU [B, T, 4D]
         let h2_2d = h2.reshape((batch * seq_len, MLP_DIM))?;
         let mlp_out = h2_2d.matmul(&layer.fc2.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let mlp_out = if training { candle_nn::ops::dropout(&mlp_out, DROPOUT_RATE)? } else { mlp_out };
         x = (x + mlp_out)?;
     }
 
