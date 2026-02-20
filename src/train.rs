@@ -179,6 +179,7 @@ pub fn train(
     max_lr: f32,
     min_lr: f32,
     ctrlc_flag: Arc<AtomicBool>,
+    checkpoint_prefix: &str,
 ) {
     println!("=== Starting Training (Multi-Core with Rayon) ===");
     if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
@@ -615,7 +616,7 @@ pub fn train(
             ckpt_buf = serialize_checkpoint(model, iter, step, best_loss);
             if best_iter == iter {
                 ckpt_best_buf = ckpt_buf.clone();
-                flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                     .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
             }
 
@@ -628,11 +629,11 @@ pub fn train(
                     EARLY_STOP_PATIENCE, EARLY_STOP_PATIENCE * EVAL_INTERVAL);
                 println!("Best val loss was {:.4} @{}. Saving checkpoint and stopping.", best_loss, best_iter);
                 println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
-                flush_checkpoint("checkpoint.bin", &ckpt_buf)
+                flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
                     .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                     .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 if !ckpt_best_buf.is_empty() {
-                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                    flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                         .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
                         .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 }
@@ -651,10 +652,10 @@ pub fn train(
             println!();
             println!("Interrupted at iteration {}. Saving checkpoint...", iter);
             println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
-            flush_checkpoint("checkpoint.bin", &ckpt_buf)
+            flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
                 .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
-            flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+            flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                 .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             std::process::exit(0);
@@ -670,11 +671,11 @@ pub fn train(
     println!("Best loss: {:.4} at iteration {}", best_loss, best_iter);
 
     if !ckpt_buf.is_empty() {
-        flush_checkpoint("checkpoint.bin", &ckpt_buf)
+        flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
             .unwrap_or_else(|e| eprintln!("Warning: could not save checkpoint: {}", e));
     }
     if !ckpt_best_buf.is_empty() {
-        flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+        flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
             .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
     }
 }
@@ -697,6 +698,7 @@ pub fn train_candle(
     max_lr: f32,
     min_lr: f32,
     ctrlc_flag: Arc<AtomicBool>,
+    checkpoint_prefix: &str,
 ) {
     println!("=== Starting Training (Metal GPU via Candle) ===");
     if iter_start > 0 { println!("Resuming from iteration {}", iter_start); }
@@ -860,7 +862,7 @@ pub fn train_candle(
             if new_best || ckpt_best_buf.is_empty() {
                 ckpt_best_buf = ckpt_buf.clone();
                 if new_best {
-                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                    flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                         .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
                 }
             }
@@ -874,11 +876,11 @@ pub fn train_candle(
                     EARLY_STOP_PATIENCE, EARLY_STOP_PATIENCE * EVAL_INTERVAL);
                 println!("Best val loss was {:.4}. Saving checkpoint and stopping.", best_val_loss);
                 println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
-                flush_checkpoint("checkpoint.bin", &ckpt_buf)
+                flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
                     .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                     .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 if !ckpt_best_buf.is_empty() {
-                    flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+                    flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                         .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
                         .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 }
@@ -895,10 +897,10 @@ pub fn train_candle(
             println!();
             println!("Interrupted at iteration {}. Saving checkpoint...", iter);
             println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
-            flush_checkpoint("checkpoint.bin", &ckpt_buf)
+            flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
                 .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
-            flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+            flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
                 .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             std::process::exit(0);
@@ -913,11 +915,11 @@ pub fn train_candle(
     println!("Best val loss: {:.4}", best_val_loss);
 
     if !ckpt_buf.is_empty() {
-        flush_checkpoint("checkpoint.bin", &ckpt_buf)
+        flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
             .unwrap_or_else(|e| eprintln!("Warning: could not save checkpoint: {}", e));
     }
     if !ckpt_best_buf.is_empty() {
-        flush_checkpoint("checkpoint_best.bin", &ckpt_best_buf)
+        flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
             .unwrap_or_else(|e| eprintln!("Warning: could not save best checkpoint: {}", e));
     }
 }

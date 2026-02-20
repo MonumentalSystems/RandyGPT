@@ -84,8 +84,9 @@ fn main() -> std::io::Result<()> {
     let mut serve_mode:      bool = false;
     let mut serve_addr:      Option<String> = None;
     let mut api_key:         Option<String> = None;
-    let mut train_file:      String = "train.txt".to_string();
-    let mut vocab_path:      String = BPE_VOCAB_PATH.to_string();
+    let mut train_file:         String = "train.txt".to_string();
+    let mut vocab_path:         String = BPE_VOCAB_PATH.to_string();
+    let mut checkpoint_prefix:  String = "checkpoint".to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -100,7 +101,8 @@ fn main() -> std::io::Result<()> {
                     i += 1;
                     resume_path = Some(args[i].clone());
                 } else {
-                    resume_path = Some("checkpoint.bin".to_string());
+                    // deferred: will use checkpoint_prefix once fully parsed
+                    resume_path = Some("__default__".to_string());
                 }
             }
             "--lr" => {
@@ -163,6 +165,13 @@ fn main() -> std::io::Result<()> {
                     vocab_path = args[i].clone();
                 }
             }
+            "--checkpoint" => {
+                i += 1;
+                if i < args.len() {
+                    // Strip .bin suffix if provided — we append it ourselves
+                    checkpoint_prefix = args[i].trim_end_matches(".bin").to_string();
+                }
+            }
             "--help" | "-h" => {
                 println!("randyGPT — tiny GPT language model\n");
                 println!("USAGE:");
@@ -171,8 +180,9 @@ fn main() -> std::io::Result<()> {
                 println!("  --iters N          Training iterations (default: {})", MAX_ITERS);
                 println!("  --train-file PATH  Training text file (default: train.txt)");
                 println!("  --vocab PATH       BPE vocab JSON file (default: vocab.json)");
+                println!("  --checkpoint NAME  Checkpoint filename prefix (default: checkpoint)");
                 println!("  --bpe [N]          Use BPE tokenizer, optional target vocab size");
-                println!("  --resume [PATH]    Resume from checkpoint (default: checkpoint.bin)");
+                println!("  --resume [PATH]    Resume from checkpoint (default: <prefix>_best.bin)");
                 println!("  --lr LR            Learning rate override");
                 println!("  --min-lr LR        Minimum learning rate override\n");
                 println!("INFERENCE:");
@@ -181,7 +191,7 @@ fn main() -> std::io::Result<()> {
                 println!("  --api-key KEY           API key for server auth\n");
                 println!("EXAMPLES:");
                 println!("  randygpt --bpe --iters 10000");
-                println!("  randygpt --bpe --train-file train_rust.txt --vocab vocab_rust.json --iters 5000");
+                println!("  randygpt --bpe --train-file train_rust.txt --vocab vocab_rust.json --checkpoint checkpoint_rust --iters 5000");
                 println!("  randygpt --bpe --resume --generate \"fn main\"");
                 std::process::exit(0);
             }
@@ -198,12 +208,25 @@ fn main() -> std::io::Result<()> {
     let lr     = lr_override.unwrap_or(LEARNING_RATE);
     let min_lr = min_lr_override.unwrap_or(MIN_LEARNING_RATE);
 
+    // Resolve deferred --resume (bare flag with no path)
+    if resume_path.as_deref() == Some("__default__") {
+        let best = format!("{}_best.bin", checkpoint_prefix);
+        let cur  = format!("{}.bin",      checkpoint_prefix);
+        if Path::new(&best).exists() {
+            resume_path = Some(best);
+        } else {
+            resume_path = Some(cur);
+        }
+    }
+
     // --generate implies --resume if no explicit --resume given
     if generate_mode && resume_path.is_none() {
-        if Path::new("checkpoint_best.bin").exists() {
-            resume_path = Some("checkpoint_best.bin".to_string());
-        } else if Path::new("checkpoint.bin").exists() {
-            resume_path = Some("checkpoint.bin".to_string());
+        let best = format!("{}_best.bin", checkpoint_prefix);
+        let cur  = format!("{}.bin",      checkpoint_prefix);
+        if Path::new(&best).exists() {
+            resume_path = Some(best);
+        } else if Path::new(&cur).exists() {
+            resume_path = Some(cur);
         } else {
             eprintln!("Error: --generate requires a checkpoint file. Train first or specify --resume <path>.");
             return Ok(());
@@ -212,18 +235,21 @@ fn main() -> std::io::Result<()> {
 
     // --serve implies --resume if no explicit --resume given
     if serve_mode && resume_path.is_none() {
-        if Path::new("checkpoint_best.bin").exists() {
-            resume_path = Some("checkpoint_best.bin".to_string());
-        } else if Path::new("checkpoint.bin").exists() {
-            resume_path = Some("checkpoint.bin".to_string());
+        let best = format!("{}_best.bin", checkpoint_prefix);
+        let cur  = format!("{}.bin",      checkpoint_prefix);
+        if Path::new(&best).exists() {
+            resume_path = Some(best);
+        } else if Path::new(&cur).exists() {
+            resume_path = Some(cur);
         } else {
             eprintln!("Error: --serve requires a checkpoint file. Train first or specify --resume <path>.");
             return Ok(());
         }
     }
 
-    if !generate_mode && resume_path.is_none() && Path::new("checkpoint.bin").exists() {
-        eprintln!("Found checkpoint.bin — use --resume to continue from it, or delete it to start fresh.");
+    let ckpt_bin = format!("{}.bin", checkpoint_prefix);
+    if !generate_mode && resume_path.is_none() && Path::new(&ckpt_bin).exists() {
+        eprintln!("Found {} — use --resume to continue from it, or delete it to start fresh.", ckpt_bin);
     }
     if lr_override.is_some() || min_lr_override.is_some() {
         println!("LR override: {} → {}", lr, min_lr);
@@ -609,13 +635,15 @@ fn main() -> std::io::Result<()> {
         train_candle(&mut candle_model, &mut opt, &data, &val_data,
             &valid_starts, &val_valid_starts,
             iterations, &mut rng,
-            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
+            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag,
+            &checkpoint_prefix);
         model = candle_model.to_gpt()
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
     } else {
         train(&mut model, &data, &val_data, &valid_starts, &val_valid_starts,
             iterations, &mut rng,
-            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag);
+            iter_start, step_start, best_loss_start, lr, min_lr, ctrlc_flag,
+            &checkpoint_prefix);
     }
 
     // ── Final loss estimate ───────────────────────────────────────────
