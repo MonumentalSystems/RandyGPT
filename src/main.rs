@@ -229,12 +229,13 @@ fn main() -> std::io::Result<()> {
         println!("LR override: {} → {}", lr, min_lr);
     }
 
-    let model_size_name = if cfg!(feature = "model-xs")   { "XS (~726K)"   }
-                          else if cfg!(feature = "model-s")    { "S (~1.6M)"    }
+    let model_size_name = if cfg!(feature = "model-s")    { "S (~1.6M)"    }
+                          else if cfg!(feature = "model-ds")   { "DS (~2.78M)"  }
                           else if cfg!(feature = "model-m")    { "M (~2.7M)"    }
+                          else if cfg!(feature = "model-l")    { "L (~4.82M)"   }
                           else if cfg!(feature = "model-deep") { "Deep (~7.5M)" }
                           else if cfg!(feature = "model-xl")   { "XL (~10.8M)"  }
-                          else                                 { "L (~4.82M)"   };
+                          else                                 { "XS (~0.86M)"  };
     println!("=== Enhanced randyGPT ===");
     println!("Model: {} — {} layers, {} heads, {}-dim", model_size_name, N_LAYER, N_HEAD, N_EMBD);
     println!("Block size: {}, Vocab size: up to {}", BLOCK_SIZE, MAX_VOCAB);
@@ -245,15 +246,15 @@ fn main() -> std::io::Result<()> {
     // ── Generate-only: skip training data, just load tokenizer ──────
     if generate_mode {
         let tokenizer = if let Some(_target) = bpe_vocab_size {
-            if Path::new(BPE_VOCAB_PATH).exists() {
-                println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
-                let t = Tokenizer::load_bpe(BPE_VOCAB_PATH)
+            if Path::new(&vocab_path).exists() {
+                println!("Loading BPE vocab from {}...", vocab_path);
+                let t = Tokenizer::load_bpe(&vocab_path)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 println!("Loaded BPE vocab ({} tokens)", t.vocab_size);
                 t
             } else {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
-                    "No vocab.json found. Train a model first before using --generate."));
+                    format!("No {} found. Train a model first before using --generate.", vocab_path)));
             }
         } else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other,
@@ -306,15 +307,15 @@ fn main() -> std::io::Result<()> {
         let addr = serve_addr.unwrap_or_else(|| "0.0.0.0:8080".to_string());
 
         let tokenizer = if let Some(_target) = bpe_vocab_size {
-            if Path::new(BPE_VOCAB_PATH).exists() {
-                println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
-                let t = Tokenizer::load_bpe(BPE_VOCAB_PATH)
+            if Path::new(&vocab_path).exists() {
+                println!("Loading BPE vocab from {}...", vocab_path);
+                let t = Tokenizer::load_bpe(&vocab_path)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 println!("Loaded BPE vocab ({} tokens)", t.vocab_size);
                 t
             } else {
                 return Err(std::io::Error::new(std::io::ErrorKind::NotFound,
-                    "No vocab.json found. Train first or specify --bpe."));
+                    format!("No {} found. Train first or specify --bpe.", vocab_path)));
             }
         } else {
             return Err(std::io::Error::new(std::io::ErrorKind::Other,
