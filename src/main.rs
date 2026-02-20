@@ -87,6 +87,7 @@ fn main() -> std::io::Result<()> {
     let mut train_file:              String = "train.txt".to_string();
     let mut vocab_path:              String = BPE_VOCAB_PATH.to_string();
     let mut checkpoint_prefix_arg:   Option<String> = None;
+    let mut fine_tune:               bool = false;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -172,6 +173,7 @@ fn main() -> std::io::Result<()> {
                     checkpoint_prefix_arg = Some(args[i].trim_end_matches(".bin").to_string());
                 }
             }
+            "--fine-tune" => { fine_tune = true; }
             "--help" | "-h" => {
                 println!("randyGPT — tiny GPT language model\n");
                 println!("USAGE:");
@@ -183,6 +185,7 @@ fn main() -> std::io::Result<()> {
                 println!("  --checkpoint NAME  Checkpoint filename prefix (default: checkpoint)");
                 println!("  --bpe [N]          Use BPE tokenizer, optional target vocab size");
                 println!("  --resume [PATH]    Resume from checkpoint (default: <prefix>_best.bin)");
+                println!("  --fine-tune        Load weights only, reset iter/step/best val (for domain transfer)");
                 println!("  --lr LR            Learning rate override");
                 println!("  --min-lr LR        Minimum learning rate override\n");
                 println!("INFERENCE:");
@@ -586,9 +589,15 @@ fn main() -> std::io::Result<()> {
 
         match result {
             Ok((it, st, bl)) => {
-                println!("✓ Resumed from '{}' — iter {}, step {}, best loss {:.4}", ckpt, it, st, bl);
-                println!();
-                (it, st, bl)
+                if fine_tune {
+                    println!("✓ Loaded weights from '{}' (fine-tune: iter/step/best reset)", ckpt);
+                    println!();
+                    (0, 0, f32::INFINITY)
+                } else {
+                    println!("✓ Resumed from '{}' — iter {}, step {}, best loss {:.4}", ckpt, it, st, bl);
+                    println!();
+                    (it, st, bl)
+                }
             }
             Err(e) => {
                 eprintln!("Error loading checkpoint '{}': {}", ckpt, e);
