@@ -22,7 +22,7 @@ use model::{CandleModel, GPTModel};
 use optimizer::GpuAdamState;
 use rng::Rng;
 use tokenizer::Tokenizer;
-use train::{estimate_loss, generate, generate_cpu, train, train_candle};
+use train::{estimate_loss, generate, generate_cpu, generate_cpu_streaming, train, train_candle};
 
 fn load_training_data(path: &str) -> std::io::Result<String> {
     let file = File::open(path)?;
@@ -362,8 +362,8 @@ fn main() -> std::io::Result<()> {
             println!("────────────────────────────────────");
             println!("Prompt: \"{}\"", prompt);
             println!("────────────────────────────────────");
-            let sample = generate_cpu(&model, &tokenizer, prompt, gen_max_tokens, gen_temperature, gen_top_k, &mut rng);
-            println!("{}", sample);
+            generate_cpu_streaming(&model, &tokenizer, prompt, gen_max_tokens, gen_temperature, gen_top_k, &mut rng);
+            println!();
             println!();
         }
         return Ok(());

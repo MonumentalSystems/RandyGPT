@@ -87,7 +87,19 @@ pub fn generate_cpu(
     top_p: f32,
     rng: &mut Rng,
 ) -> String {
-    generate_inner(model, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, true)
+    generate_inner(model, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, false)
+}
+
+pub fn generate_cpu_streaming(
+    model: &GPTModel,
+    tokenizer: &Tokenizer,
+    prompt: &str,
+    max_new_tokens: usize,
+    temperature: f32,
+    top_p: f32,
+    rng: &mut Rng,
+) {
+    generate_inner(model, tokenizer, prompt, max_new_tokens, temperature, top_p, rng, true);
 }
 
 fn generate_inner(
@@ -98,10 +110,13 @@ fn generate_inner(
     temperature: f32,
     top_p: f32,
     rng: &mut Rng,
-    _force_cpu: bool,
+    stream: bool,
 ) -> String {
     let mut tokens = tokenizer.encode(prompt);
-    let max_len = tokens.len() + max_new_tokens;
+    // Empty prompt → seed with BOS so forward() has at least one token to work with.
+    if tokens.is_empty() {
+        tokens.push(tokenizer.bos_id);
+    }
 
     // Helper: sample the next token from a logits vector using top-p (nucleus) sampling.
     let sample = |logits: &[f32], probs: &mut Vec<f32>, rng: &mut Rng| -> usize {
@@ -134,20 +149,28 @@ fn generate_inner(
     let mut probs = vec![0.0f32; model.vocab_size];
 
     // Collect only the newly generated tokens so we never return the prompt.
+    // Use generated.len() as the counter — tokens.len() shrinks on each slide
+    // and can't be used to track progress once the context window is full.
     let mut generated: Vec<usize> = Vec::new();
 
-    while tokens.len() < max_len {
+    while generated.len() < max_new_tokens {
         let next_token = sample(&last_logits, &mut probs, rng);
         if next_token == tokenizer.eos_id { break; }
+        if stream {
+            use std::io::Write;
+            print!("{}", tokenizer.decode(&[next_token]));
+            let _ = std::io::stdout().flush();
+        }
         generated.push(next_token);
         tokens.push(next_token);
 
         if tokens.len() > BLOCK_SIZE {
-            // Slide the context window and rebuild the KV cache from scratch.
-            tokens = tokens[1..].to_vec();
-            kv_cache = (0..N_LAYER).map(|_| Vec::new()).collect();
-            let (logits, _) = forward(&tokens, model, &mut kv_cache, false, None, 0);
-            last_logits = logits.last().unwrap().clone();
+            // Slide the context window: keep last BLOCK_SIZE tokens.
+            // Use Metal-accelerated forward for the heavy matmuls — KV cache
+            // can't be reused after a slide (absolute position embeddings).
+            tokens = tokens[tokens.len() - BLOCK_SIZE..].to_vec();
+            let logits = forward_metal_logits(&tokens, model);
+            last_logits = logits.into_iter().last().unwrap();
         } else {
             // Decode: process only the single new token at its absolute position.
             // The KV cache already holds entries for all prior positions, so this
