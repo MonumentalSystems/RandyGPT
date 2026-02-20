@@ -173,7 +173,8 @@ class Tokenizer:
 
 # ── Load model once at startup ────────────────────────────────────────────────
 
-REPO = "MonumentalSystems/randygpt-s"
+import os
+REPO = os.environ.get("MODEL_REPO", "MonumentalSystems/randygpt-s")
 DEVICE = "cpu"   # HF free-tier Spaces use CPU
 
 print(f"Loading model from {REPO} …")
