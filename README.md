@@ -201,6 +201,9 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] HuggingFace Space — Gradio UI loading model from Hub (v0.9.6)
 - [x] model-ds preset — 128-dim, 4-head, 12-layer (~2.78M params, deep-s) (v0.9.6)
 - [x] Per-model HF Spaces via MODEL_REPO env var (v0.9.6)
+- [x] PyTorch training on NVIDIA GPU — Colab T4/V100/A100, RGPT0003-compatible checkpoints (v0.9.7)
+- [x] Gutenberg corpus v2 cleaning — Ulysses excluded, pipes/emails/repeated chars stripped (v0.9.7)
+- [x] 1500-token BPE vocab rebuilt from cleaned v2 corpus (v0.9.7)
 
 ## HuggingFace Export & Deployment
 
@@ -229,8 +232,49 @@ hf repo create MonumentalSystems/randygpt-space --repo-type space --space-sdk gr
 | `scripts/export_hf.py` | Export RGPT0003 checkpoint → safetensors + HF config files |
 | `scripts/modeling_randygpt.py` | PyTorch `PreTrainedModel` matching the Rust forward pass exactly |
 | `scripts/tokenizer_randygpt.py` | Python BPE tokenizer matching the Rust encoder exactly |
+| `scripts/train_torch.py` | PyTorch training loop for NVIDIA GPU (Colab T4/V100/A100) |
+| `scripts/write_rgpt_checkpoint.py` | Write RGPT0003 binary from PyTorch model + optimizer state |
 | `scripts/publish_hf.sh` | One-shot export + upload to Hub + upload Space |
 | `spaces/app.py` | Gradio Space — loads model from Hub, HF hosts the compute |
+
+## Colab GPU Training
+
+Train on Google Colab NVIDIA GPU (~6-10x faster than Metal for larger models).
+Produces RGPT0003-compatible checkpoints loadable by the Rust inference server.
+
+See **`colab/RUNBOOK.md`** for the full step-by-step guide including rclone setup,
+pre-generating the token cache locally, and resuming after session timeout.
+
+### Quick start
+
+```bash
+# 1. Generate token cache locally (do once, upload to Drive — saves ~15 min per Colab session)
+python3 -c "
+import sys, numpy as np, time
+sys.path.insert(0, 'scripts')
+from tokenizer_randygpt import RandyGPTTokenizer
+tok = RandyGPTTokenizer.from_file('vocab.json')
+ids = tok.encode(open('train.txt', encoding='utf-8').read())
+np.array(ids, dtype=np.uint32).tofile('train.txt.tokens.bin')
+"
+
+# 2. Upload to Drive
+rclone copy train.txt.tokens.bin gdrive:randyGPT/ --progress
+rclone sync scripts/ gdrive:randyGPT/scripts/ --include "*.py" --exclude "__pycache__/**" --progress
+
+# 3. After training, pull checkpoint
+rclone copy gdrive:randyGPT/checkpoint_best.bin . --progress
+```
+
+Open `colab/randygpt_train.ipynb` in Colab, set `MODEL_SIZE`, `ITERS`, `DTYPE`, run cells 1-5.
+
+### Recommended settings by GPU
+
+| GPU | dtype | Model | Batch | ms/iter |
+|-----|-------|-------|-------|---------|
+| T4  | fp16  | s     | 256   | ~500ms  |
+| V100 | fp16 | ds    | 256   | ~380ms  |
+| A100 | bf16 | l     | 512   | ~220ms  |
 
 ### Manual export
 
