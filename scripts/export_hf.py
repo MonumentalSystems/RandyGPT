@@ -38,6 +38,7 @@ PRESETS = {
     "s":    dict(n_embd=128, n_head=4, n_layer=8),
     "s2":   dict(n_embd=128, n_head=4, n_layer=8),   # s trained on cleaned v2 corpus
     "ds":   dict(n_embd=128, n_head=4, n_layer=12),  # deep-s
+    "ds2":  dict(n_embd=128, n_head=4, n_layer=12),  # deep-s v3 corpus + dropout
     "m":    dict(n_embd=192, n_head=6, n_layer=6),
     "l":    dict(n_embd=256, n_head=8, n_layer=6),
     "deep": dict(n_embd=192, n_head=6, n_layer=16),
@@ -230,9 +231,10 @@ A GPT-style language model trained from scratch in Rust on Project Gutenberg.
 
 ## Training
 
-Trained on ~103MB of cleaned Project Gutenberg text (114 public domain books)
-with BPE-{meta['vocab_size']} tokenization, AdamW optimizer, cosine LR decay,
-and ReduceLROnPlateau. Metal GPU via Candle on Apple Silicon.
+Trained on ~98MB of cleaned Project Gutenberg text (112 public domain books,
+v3 cleaning with Unicode normalization) with BPE-{meta['vocab_size']} tokenization,
+AdamW optimizer, cosine LR decay, ReduceLROnPlateau, dropout=0.1, and
+Metal GPU via Candle on Apple Silicon.
 
 ## Usage
 

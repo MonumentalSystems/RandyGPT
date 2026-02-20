@@ -312,6 +312,9 @@ fn main() -> std::io::Result<()> {
 
     // ── Generate-only: skip training data, just load tokenizer ──────
     if generate_mode {
+        // Force Metal init now so the banner prints before any generation output.
+        let _ = METAL_DEVICE.is_some();
+
         let tokenizer = if let Some(_target) = bpe_vocab_size {
             if Path::new(&vocab_path).exists() {
                 println!("Loading BPE vocab from {}...", vocab_path);
