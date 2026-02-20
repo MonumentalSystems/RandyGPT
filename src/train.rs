@@ -630,11 +630,11 @@ pub fn train(
                 println!("Best val loss was {:.4} @{}. Saving checkpoint and stopping.", best_loss, best_iter);
                 println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
                 flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
-                    .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                    .map(|_| println!("✓ Saved {}.bin (iter {})", checkpoint_prefix, iter))
                     .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 if !ckpt_best_buf.is_empty() {
                     flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
-                        .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                        .map(|_| println!("✓ Saved {}_best.bin (best loss {:.4} @{})", checkpoint_prefix, best_loss, best_iter))
                         .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 }
                 return;
@@ -653,10 +653,10 @@ pub fn train(
             println!("Interrupted at iteration {}. Saving checkpoint...", iter);
             println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
             flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
-                .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                .map(|_| println!("✓ Saved {}.bin (iter {})", checkpoint_prefix, iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
-                .map(|_| println!("✓ Saved checkpoint_best.bin (best loss {:.4} @{})", best_loss, best_iter))
+                .map(|_| println!("✓ Saved {}_best.bin (best loss {:.4} @{})", checkpoint_prefix, best_loss, best_iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             std::process::exit(0);
         }
@@ -877,11 +877,11 @@ pub fn train_candle(
                 println!("Best val loss was {:.4}. Saving checkpoint and stopping.", best_val_loss);
                 println!("Total time: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
                 flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
-                    .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                    .map(|_| println!("✓ Saved {}.bin (iter {})", checkpoint_prefix, iter))
                     .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 if !ckpt_best_buf.is_empty() {
                     flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
-                        .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
+                        .map(|_| println!("✓ Saved {}_best.bin (best val loss {:.4})", checkpoint_prefix, best_val_loss))
                         .unwrap_or_else(|e| eprintln!("Warning: {}", e));
                 }
                 return;
@@ -898,10 +898,10 @@ pub fn train_candle(
             println!("Interrupted at iteration {}. Saving checkpoint...", iter);
             println!("Elapsed: {:.1}s | Avg: {:.0}ms/iter", elapsed, avg_ms);
             flush_checkpoint(&format!("{}.bin", checkpoint_prefix), &ckpt_buf)
-                .map(|_| println!("✓ Saved checkpoint.bin (iter {})", iter))
+                .map(|_| println!("✓ Saved {}.bin (iter {})", checkpoint_prefix, iter))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             flush_checkpoint(&format!("{}_best.bin", checkpoint_prefix), &ckpt_best_buf)
-                .map(|_| println!("✓ Saved checkpoint_best.bin (best val loss {:.4})", best_val_loss))
+                .map(|_| println!("✓ Saved {}_best.bin (best val loss {:.4})", checkpoint_prefix, best_val_loss))
                 .unwrap_or_else(|e| eprintln!("Warning: {}", e));
             std::process::exit(0);
         }

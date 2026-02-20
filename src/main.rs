@@ -84,9 +84,9 @@ fn main() -> std::io::Result<()> {
     let mut serve_mode:      bool = false;
     let mut serve_addr:      Option<String> = None;
     let mut api_key:         Option<String> = None;
-    let mut train_file:         String = "train.txt".to_string();
-    let mut vocab_path:         String = BPE_VOCAB_PATH.to_string();
-    let mut checkpoint_prefix:  String = "checkpoint".to_string();
+    let mut train_file:              String = "train.txt".to_string();
+    let mut vocab_path:              String = BPE_VOCAB_PATH.to_string();
+    let mut checkpoint_prefix_arg:   Option<String> = None;
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -169,7 +169,7 @@ fn main() -> std::io::Result<()> {
                 i += 1;
                 if i < args.len() {
                     // Strip .bin suffix if provided — we append it ourselves
-                    checkpoint_prefix = args[i].trim_end_matches(".bin").to_string();
+                    checkpoint_prefix_arg = Some(args[i].trim_end_matches(".bin").to_string());
                 }
             }
             "--help" | "-h" => {
@@ -207,6 +207,20 @@ fn main() -> std::io::Result<()> {
     }
     let lr     = lr_override.unwrap_or(LEARNING_RATE);
     let min_lr = min_lr_override.unwrap_or(MIN_LEARNING_RATE);
+
+    // Derive checkpoint prefix: explicit --checkpoint > stem of --train-file > "checkpoint"
+    let checkpoint_prefix = checkpoint_prefix_arg.unwrap_or_else(|| {
+        let stem = std::path::Path::new(&train_file)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("checkpoint");
+        // train.txt → checkpoint, train_rust.txt → checkpoint_rust
+        if stem == "train" {
+            "checkpoint".to_string()
+        } else {
+            format!("checkpoint_{}", stem.trim_start_matches("train_"))
+        }
+    });
 
     // Resolve deferred --resume (bare flag with no path)
     if resume_path.as_deref() == Some("__default__") {
