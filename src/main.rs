@@ -84,6 +84,8 @@ fn main() -> std::io::Result<()> {
     let mut serve_mode:      bool = false;
     let mut serve_addr:      Option<String> = None;
     let mut api_key:         Option<String> = None;
+    let mut train_file:      String = "train.txt".to_string();
+    let mut vocab_path:      String = BPE_VOCAB_PATH.to_string();
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
@@ -148,6 +150,40 @@ fn main() -> std::io::Result<()> {
                 if i < args.len() {
                     api_key = Some(args[i].clone());
                 }
+            }
+            "--train-file" => {
+                i += 1;
+                if i < args.len() {
+                    train_file = args[i].clone();
+                }
+            }
+            "--vocab" => {
+                i += 1;
+                if i < args.len() {
+                    vocab_path = args[i].clone();
+                }
+            }
+            "--help" | "-h" => {
+                println!("randyGPT — tiny GPT language model\n");
+                println!("USAGE:");
+                println!("  randygpt [OPTIONS]\n");
+                println!("TRAINING:");
+                println!("  --iters N          Training iterations (default: {})", MAX_ITERS);
+                println!("  --train-file PATH  Training text file (default: train.txt)");
+                println!("  --vocab PATH       BPE vocab JSON file (default: vocab.json)");
+                println!("  --bpe [N]          Use BPE tokenizer, optional target vocab size");
+                println!("  --resume [PATH]    Resume from checkpoint (default: checkpoint.bin)");
+                println!("  --lr LR            Learning rate override");
+                println!("  --min-lr LR        Minimum learning rate override\n");
+                println!("INFERENCE:");
+                println!("  --generate [PROMPT...]  Generate text from checkpoint");
+                println!("  --serve [ADDR]          Start HTTP server (default: 0.0.0.0:8080)");
+                println!("  --api-key KEY           API key for server auth\n");
+                println!("EXAMPLES:");
+                println!("  randygpt --bpe --iters 10000");
+                println!("  randygpt --bpe --train-file train_rust.txt --vocab vocab_rust.json --iters 5000");
+                println!("  randygpt --bpe --resume --generate \"fn main\"");
+                std::process::exit(0);
             }
             other => {
                 if let Ok(n) = other.parse::<usize>() {
@@ -320,19 +356,19 @@ fn main() -> std::io::Result<()> {
     // ── Load training data + tokenizer + tokens ─────────────────────────
     // Memory optimization: if we have both tokens.bin and vocab.json cached,
     // skip loading the raw training text entirely (saves ~110MB for large corpora).
-    let token_cache_path = "tokens.bin";
-    let have_token_cache = Path::new(token_cache_path).exists();
-    let have_bpe_vocab   = bpe_vocab_size.is_some() && Path::new(BPE_VOCAB_PATH).exists();
+    let token_cache_path = format!("{}.tokens.bin", train_file);
+    let have_token_cache = Path::new(&token_cache_path).exists();
+    let have_bpe_vocab   = bpe_vocab_size.is_some() && Path::new(&vocab_path).exists();
 
     let (tokenizer, data, val_data) = if have_token_cache && have_bpe_vocab {
         // Fast path: load vocab + cached tokens, skip raw text entirely
-        println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
-        let tokenizer = Tokenizer::load_bpe(BPE_VOCAB_PATH)
+        println!("Loading BPE vocab from {}...", vocab_path);
+        let tokenizer = Tokenizer::load_bpe(&vocab_path)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
         println!("Loaded BPE vocab ({} tokens)", tokenizer.vocab_size);
 
         println!("Loading cached tokens from {}...", token_cache_path);
-        let mut f = File::open(token_cache_path)?;
+        let mut f = File::open(&token_cache_path)?;
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
         let data_all: Vec<usize> = buf.chunks_exact(4)
@@ -344,18 +380,18 @@ fn main() -> std::io::Result<()> {
         let val_split = (data_all.len() * 9) / 10;
         let data     = data_all[..val_split].to_vec();
         let val_data = data_all[val_split..].to_vec();
-        println!("Tokens: {} train, {} val (skipped train.txt — using cache)",
-            data.len(), val_data.len());
+        println!("Tokens: {} train, {} val (skipped {} — using cache)",
+            data.len(), val_data.len(), train_file);
         // data_all dropped here when it goes out of scope
 
         (tokenizer, data, val_data)
     } else {
         // Full path: load text, build/load tokenizer, tokenize, cache
-        let training_text = if Path::new("train.txt").exists() {
-            println!("Loading training data from train.txt...");
-            load_training_data("train.txt")?
+        let training_text = if Path::new(&train_file).exists() {
+            println!("Loading training data from {}...", train_file);
+            load_training_data(&train_file)?
         } else {
-            println!("No train.txt found. Using default sample data.");
+            println!("No {} found. Using default sample data.", train_file);
             concat!(
                 "The quick brown fox jumps over the lazy dog. ",
                 "Rust is a systems programming language. ",
@@ -369,23 +405,23 @@ fn main() -> std::io::Result<()> {
         println!("Training data size: {} characters", training_text.len());
 
         let tokenizer = if let Some(target) = bpe_vocab_size {
-            if Path::new(BPE_VOCAB_PATH).exists() {
-                println!("Loading BPE vocab from {}...", BPE_VOCAB_PATH);
-                match Tokenizer::load_bpe(BPE_VOCAB_PATH) {
+            if Path::new(&vocab_path).exists() {
+                println!("Loading BPE vocab from {}...", vocab_path);
+                match Tokenizer::load_bpe(&vocab_path) {
                     Ok(t)  => { println!("Loaded BPE vocab ({} tokens)", t.vocab_size); t }
                     Err(e) => {
-                        eprintln!("Failed to load {}: {}. Retraining...", BPE_VOCAB_PATH, e);
+                        eprintln!("Failed to load {}: {}. Retraining...", vocab_path, e);
                         let t = Tokenizer::from_text_bpe(&training_text, target);
-                        t.save_bpe(BPE_VOCAB_PATH)?;
-                        println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+                        t.save_bpe(&vocab_path)?;
+                        println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, vocab_path);
                         t
                     }
                 }
             } else {
                 println!("Training BPE tokenizer (target vocab: {})...", target);
                 let t = Tokenizer::from_text_bpe(&training_text, target);
-                t.save_bpe(BPE_VOCAB_PATH)?;
-                println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, BPE_VOCAB_PATH);
+                t.save_bpe(&vocab_path)?;
+                println!("BPE vocab ({} tokens) saved to {}", t.vocab_size, vocab_path);
                 t
             }
         } else {
@@ -394,7 +430,7 @@ fn main() -> std::io::Result<()> {
 
         let data_all = if have_token_cache {
             println!("Loading cached tokens from {}...", token_cache_path);
-            let mut f = File::open(token_cache_path)?;
+            let mut f = File::open(&token_cache_path)?;
             let mut buf = Vec::new();
             f.read_to_end(&mut buf)?;
             let tokens: Vec<usize> = buf.chunks_exact(4)
@@ -405,7 +441,7 @@ fn main() -> std::io::Result<()> {
         } else {
             println!("Tokenizing text ({} chars)...", training_text.len());
             let tokens = tokenizer.encode(&training_text);
-            let mut f = File::create(token_cache_path)?;
+            let mut f = File::create(&token_cache_path)?;
             for &t in &tokens {
                 f.write_all(&(t as u32).to_le_bytes())?;
             }
