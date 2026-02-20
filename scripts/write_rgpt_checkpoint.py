@@ -270,7 +270,7 @@ def main():
     parser.add_argument("--output", required=True,
                         help="Output .bin file path")
     parser.add_argument("--model-size", default="s",
-                        choices=["xs", "s", "ds", "m", "l", "deep", "xl"],
+                        choices=["xs", "s", "s2", "ds", "m", "l", "deep", "xl"],
                         help="Model size preset (default: s)")
     parser.add_argument("--vocab", default="vocab.json",
                         help="Path to vocab.json (default: vocab.json)")

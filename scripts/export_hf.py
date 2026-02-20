@@ -36,6 +36,7 @@ import numpy as np
 PRESETS = {
     "xs":   dict(n_embd=116, n_head=4, n_layer=3),
     "s":    dict(n_embd=128, n_head=4, n_layer=8),
+    "s2":   dict(n_embd=128, n_head=4, n_layer=8),   # s trained on cleaned v2 corpus
     "ds":   dict(n_embd=128, n_head=4, n_layer=12),  # deep-s
     "m":    dict(n_embd=192, n_head=6, n_layer=6),
     "l":    dict(n_embd=256, n_head=8, n_layer=6),

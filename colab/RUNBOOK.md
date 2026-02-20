@@ -27,12 +27,12 @@ In the config wizard:
 
 Verify:
 ```bash
-rclone lsd gdrive:
+rclone lsd richardj:
 ```
 
 ### Create Drive folder
 ```bash
-rclone mkdir gdrive:randyGPT
+rclone mkdir richardj:randyGPT
 ```
 
 ---
@@ -63,24 +63,24 @@ print('  Saved train.txt.tokens.bin')
 cd /rjs/AI/randyGPT
 
 # Training data (only when train.txt or vocab changes)
-rclone copy train.txt          gdrive:randyGPT/ --progress
-rclone copy vocab.json         gdrive:randyGPT/ --progress
-rclone copy train.txt.tokens.bin gdrive:randyGPT/ --progress
+rclone copy train.txt          richardj:randyGPT/ --progress
+rclone copy vocab.json         richardj:randyGPT/ --progress
+rclone copy train.txt.tokens.bin richardj:randyGPT/ --progress
 
 # Scripts (only when scripts change)
-rclone copy scripts/export_hf.py            gdrive:randyGPT/scripts/ --progress
-rclone copy scripts/modeling_randygpt.py    gdrive:randyGPT/scripts/ --progress
-rclone copy scripts/tokenizer_randygpt.py   gdrive:randyGPT/scripts/ --progress
-rclone copy scripts/train_torch.py          gdrive:randyGPT/scripts/ --progress
-rclone copy scripts/write_rgpt_checkpoint.py gdrive:randyGPT/scripts/ --progress
+rclone copy scripts/export_hf.py            richardj:randyGPT/scripts/ --progress
+rclone copy scripts/modeling_randygpt.py    richardj:randyGPT/scripts/ --progress
+rclone copy scripts/tokenizer_randygpt.py   richardj:randyGPT/scripts/ --progress
+rclone copy scripts/train_torch.py          richardj:randyGPT/scripts/ --progress
+rclone copy scripts/write_rgpt_checkpoint.py richardj:randyGPT/scripts/ --progress
 
 # Notebook (only when notebook changes)
-rclone copy colab/randygpt_train.ipynb gdrive:randyGPT/ --progress
+rclone copy colab/randygpt_train.ipynb richardj:randyGPT/ --progress
 ```
 
 Or all at once (re-uploads only changed files):
 ```bash
-rclone sync scripts/ gdrive:randyGPT/scripts/ \
+rclone sync scripts/ richardj:randyGPT/scripts/ \
   --include "*.py" \
   --exclude "__pycache__/**" \
   --progress
@@ -180,7 +180,7 @@ Then re-run Cells 1–5. The checkpoint header stores `iter` so training continu
 
 After training, pull the best checkpoint from Drive:
 ```bash
-rclone copy gdrive:randyGPT/checkpoint_best.bin /rjs/AI/randyGPT/ --progress
+rclone copy richardj:randyGPT/checkpoint_best.bin /rjs/AI/randyGPT/ --progress
 ```
 
 Load it with the Rust server:
@@ -205,9 +205,9 @@ python3 scripts/export_hf.py \
 # Local prep (run before each Colab session if data/scripts changed)
 cd /rjs/AI/randyGPT
 python3 -c "import sys,numpy as np,time; sys.path.insert(0,'scripts'); from tokenizer_randygpt import RandyGPTTokenizer; tok=RandyGPTTokenizer.from_file('vocab.json'); t=open('train.txt',encoding='utf-8').read(); t0=time.time(); ids=tok.encode(t); print(f'{len(ids):,} tokens in {time.time()-t0:.1f}s'); np.array(ids,dtype=np.uint32).tofile('train.txt.tokens.bin')"
-rclone sync . gdrive:randyGPT/ --include "*.bin" --include "vocab.json" --include "train.txt" --progress
-rclone sync scripts/ gdrive:randyGPT/scripts/ --include "*.py" --exclude "__pycache__/**" --progress
+rclone sync . richardj:randyGPT/ --include "*.bin" --include "vocab.json" --include "train.txt" --progress
+rclone sync scripts/ richardj:randyGPT/scripts/ --include "*.py" --exclude "__pycache__/**" --progress
 
 # Download best checkpoint after training
-rclone copy gdrive:randyGPT/checkpoint_best.bin /rjs/AI/randyGPT/ --progress
+rclone copy richardj:randyGPT/checkpoint_best.bin /rjs/AI/randyGPT/ --progress
 ```

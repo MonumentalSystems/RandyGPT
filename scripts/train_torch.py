@@ -354,20 +354,33 @@ def _load_moments_from_bin(path, model, optimizer, cfg, vocab_size):
 
 def train(args):
     # ── Device and dtype setup ─────────────────────────────────────────────────
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Device: {device}")
     if device.type == "cuda":
         print(f"GPU: {torch.cuda.get_device_name(0)}")
+    elif device.type == "mps":
+        print("GPU: Apple Metal (MPS)")
 
     dtype_map = {"fp32": torch.float32, "bf16": torch.bfloat16, "fp16": torch.float16}
     amp_dtype = dtype_map.get(args.dtype, torch.bfloat16)
 
     if device.type == "cuda":
         amp_ctx = torch.autocast(device_type="cuda", dtype=amp_dtype)
+    elif device.type == "mps":
+        # MPS supports fp16 autocast; bf16 not yet reliable — fall back to fp16
+        mps_dtype = torch.float16 if amp_dtype != torch.float32 else torch.float32
+        amp_ctx = torch.autocast(device_type="mps", dtype=mps_dtype) if mps_dtype != torch.float32 else nullcontext()
+        amp_dtype = mps_dtype
     else:
         amp_ctx = nullcontext()
         amp_dtype = torch.float32  # AMP not supported on CPU
 
+    # GradScaler: CUDA fp16 only (MPS and CPU use unscaled grads)
     use_scaler = (device.type == "cuda" and amp_dtype == torch.float16)
     scaler = torch.amp.GradScaler("cuda", enabled=use_scaler)
 
@@ -558,7 +571,7 @@ def main():
         description="Train randyGPT with PyTorch (NVIDIA GPU / Colab)"
     )
     parser.add_argument("--model-size", default="s",
-                        choices=["xs", "s", "ds", "m", "l", "deep", "xl"],
+                        choices=["xs", "s", "s2", "ds", "m", "l", "deep", "xl"],
                         help="Model size preset (default: s)")
     parser.add_argument("--iters", type=int, default=1000,
                         help="Number of training iterations (default: 1000)")
