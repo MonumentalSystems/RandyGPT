@@ -166,13 +166,14 @@ struct BpeVocabFile {
 }
 
 struct BpeTokenizer {
-    vocab:        Vec<String>,           // token_id → string
-    token_to_id:  HashMap<String, usize>, // string → token_id
-    merges:       Vec<(String, String)>,  // ordered merge rules
-    // pre-computed merge lookup: (left_id, right_id) → merged_id
-    merge_map:    HashMap<(usize, usize), usize>,
-    pub bos_id:   usize,
-    pub eos_id:   usize,
+    vocab:             Vec<String>,                    // token_id → string
+    token_to_id:       HashMap<String, usize>,         // string → token_id
+    merges:            Vec<(String, String)>,           // ordered merge rules
+    merge_map:         HashMap<(usize, usize), usize>, // (left_id, right_id) → merged_id
+    char_to_id:        HashMap<char, usize>,            // char → token_id (no String alloc per char)
+    reverse_merge_map: HashMap<usize, (usize, usize)>, // merged_id → (left_id, right_id)
+    pub bos_id:        usize,
+    pub eos_id:        usize,
 }
 
 // Free helper: update pair_counts[pair] by delta, push fresh heap entry if > 0.
@@ -305,13 +306,15 @@ impl BpeTokenizer {
 
         println!("\rBPE training: 100% ({} merges, vocab {})          ", merges.len(), vocab.len());
 
-        // Build merge_map for fast encoding
-        let merge_map = Self::build_merge_map(&vocab, &merges, &token_to_id);
+        // Build lookup tables for fast encoding
+        let merge_map         = Self::build_merge_map(&vocab, &merges, &token_to_id);
+        let char_to_id        = Self::build_char_map(&token_to_id);
+        let reverse_merge_map = Self::build_reverse_merge_map(&merge_map);
 
         let bos_id = token_to_id["<|bos|>"];
         let eos_id = token_to_id["<|eos|>"];
 
-        Self { vocab, token_to_id, merges, merge_map, bos_id, eos_id }
+        Self { vocab, token_to_id, merges, merge_map, char_to_id, reverse_merge_map, bos_id, eos_id }
     }
 
     fn build_merge_map(
@@ -324,13 +327,31 @@ impl BpeTokenizer {
             if let (Some(&l), Some(&r)) = (token_to_id.get(left), token_to_id.get(right)) {
                 let merged = format!("{}{}", left, right);
                 if let Some(&m) = token_to_id.get(&merged) {
-                    // Priority = position in vocab (lower index = earlier merge = higher priority)
                     map.entry((l, r)).or_insert(m);
-                    let _ = vocab; // suppress unused warning
+                    let _ = vocab;
                 }
             }
         }
         map
+    }
+
+    /// Single-char tokens only — avoids String allocation per character during encoding.
+    fn build_char_map(token_to_id: &HashMap<String, usize>) -> HashMap<char, usize> {
+        token_to_id.iter()
+            .filter_map(|(s, &id)| {
+                let mut it = s.chars();
+                let c = it.next()?;
+                if it.next().is_none() { Some((c, id)) } else { None }
+            })
+            .collect()
+    }
+
+    /// Inverts merge_map so the inner apply-merge loop uses two int comparisons
+    /// instead of a HashMap lookup per token pair.
+    fn build_reverse_merge_map(
+        merge_map: &HashMap<(usize, usize), usize>,
+    ) -> HashMap<usize, (usize, usize)> {
+        merge_map.iter().map(|(&(l, r), &m)| (m, (l, r))).collect()
     }
 
     // ── Save / Load ───────────────────────────────────────────────────
@@ -356,16 +377,20 @@ impl BpeTokenizer {
             .map(|(i, s)| (s.clone(), i))
             .collect();
 
-        let merge_map = Self::build_merge_map(&file.vocab, &file.merges, &token_to_id);
+        let merge_map         = Self::build_merge_map(&file.vocab, &file.merges, &token_to_id);
+        let char_to_id        = Self::build_char_map(&token_to_id);
+        let reverse_merge_map = Self::build_reverse_merge_map(&merge_map);
 
         let bos_id = *token_to_id.get("<|bos|>").unwrap_or(&0);
         let eos_id = *token_to_id.get("<|eos|>").unwrap_or(&1);
 
         Ok(Self {
-            vocab:       file.vocab,
-            merges:      file.merges,
+            vocab:             file.vocab,
+            merges:            file.merges,
             token_to_id,
             merge_map,
+            char_to_id,
+            reverse_merge_map,
             bos_id,
             eos_id,
         })
@@ -382,44 +407,50 @@ impl BpeTokenizer {
     // For large corpora, the public encode() splits on newlines and encodes
     // chunks in parallel with rayon, then concatenates.
 
-    fn encode_chunk(merge_map: &HashMap<(usize, usize), usize>, text: &str, token_to_id: &HashMap<String, usize>) -> Vec<usize> {
-        // Char-level init
+    fn encode_chunk(
+        merge_map:         &HashMap<(usize, usize), usize>,
+        reverse_merge_map: &HashMap<usize, (usize, usize)>,
+        char_to_id:        &HashMap<char, usize>,
+        text: &str,
+    ) -> Vec<usize> {
+        // Char-level init — char_to_id avoids a String heap alloc per character.
         let mut tokens: Vec<usize> = text.chars()
-            .filter_map(|c| token_to_id.get(&c.to_string()).copied())
+            .filter_map(|c| char_to_id.get(&c).copied())
             .collect();
 
         if tokens.len() < 2 { return tokens; }
 
-        // Repeatedly scan for the lowest-priority (earliest-trained) applicable merge
-        // and apply all non-overlapping instances of it in one left-to-right pass.
+        // Repeatedly find the highest-priority applicable merge and apply it.
         loop {
-            // Find the best merge applicable anywhere in tokens
             let best_merge = tokens.windows(2)
                 .filter_map(|w| merge_map.get(&(w[0], w[1])).copied())
-                .min(); // min merged_id = highest priority (earliest trained)
+                .min(); // min merged_id = earliest trained = highest priority
 
             let merged_id = match best_merge {
                 None => break,
                 Some(m) => m,
             };
 
-            // Find the pair that produces merged_id — need the (left, right) keys
-            // We stored merge_map as (left,right)→merged_id; do a reverse lookup once.
-            // Since merge_map is built from merges[], we can find it by scanning tokens.
+            // Reverse lookup: get (left_id, right_id) in O(1) — inner loop then uses
+            // two integer comparisons instead of a HashMap lookup per token pair.
+            let (left_id, right_id) = match reverse_merge_map.get(&merged_id) {
+                Some(&pair) => pair,
+                None => break,
+            };
+
             let mut out: Vec<usize> = Vec::with_capacity(tokens.len());
             let mut i = 0;
             while i < tokens.len() {
-                if i + 1 < tokens.len() {
-                    if let Some(&m) = merge_map.get(&(tokens[i], tokens[i + 1])) {
-                        if m == merged_id {
-                            out.push(merged_id);
-                            i += 2;
-                            continue;
-                        }
-                    }
+                if i + 1 < tokens.len()
+                    && tokens[i] == left_id
+                    && tokens[i + 1] == right_id
+                {
+                    out.push(merged_id);
+                    i += 2;
+                } else {
+                    out.push(tokens[i]);
+                    i += 1;
                 }
-                out.push(tokens[i]);
-                i += 1;
             }
             tokens = out;
         }
@@ -435,9 +466,12 @@ impl BpeTokenizer {
         let merge_map = &self.merge_map;
         let token_to_id = &self.token_to_id;
 
+        let reverse_merge_map = &self.reverse_merge_map;
+        let char_to_id        = &self.char_to_id;
+
         let mut result: Vec<usize> = lines.par_iter()
             .flat_map(|line| {
-                let mut chunk = Self::encode_chunk(merge_map, line, token_to_id);
+                let mut chunk = Self::encode_chunk(merge_map, reverse_merge_map, char_to_id, line);
                 chunk.push(nl_id); // re-add the newline we split on
                 chunk
             })
