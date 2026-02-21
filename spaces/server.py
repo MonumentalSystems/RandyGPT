@@ -27,13 +27,16 @@ from safetensors.torch import load_file
 
 class Cfg:
     def __init__(self, **kw):
-        self.vocab_size = kw.get("vocab_size", 1500)
-        self.n_embd     = kw.get("n_embd",     128)
-        self.n_head     = kw.get("n_head",     4)
-        self.n_layer    = kw.get("n_layer",    8)
-        self.block_size = kw.get("block_size", 256)
-        self.head_dim   = self.n_embd // self.n_head
-        self.mlp_dim    = 4 * self.n_embd
+        self.vocab_size  = kw.get("vocab_size", 1500)
+        self.n_embd      = kw.get("n_embd",     128)
+        self.n_head      = kw.get("n_head",     4)
+        self.n_layer     = kw.get("n_layer",    8)
+        self.block_size  = kw.get("block_size", 256)
+        self.head_dim    = self.n_embd // self.n_head
+        self.mlp_dim     = 4 * self.n_embd
+        self.n_experts   = kw.get("n_experts",  0)   # 0 = dense
+        self.expert_dim  = kw.get("expert_dim", 0)
+        self.moe_top_k   = kw.get("moe_top_k",  0)
 
 def rmsnorm(x, eps=1e-5):
     return x * (x.pow(2).mean(-1, keepdim=True) + eps).rsqrt()
@@ -64,14 +67,51 @@ class MLP(nn.Module):
     def forward(self, x):
         return self.fc2(F.relu(self.fc1(x)).pow(2))
 
+class MoEExpert(nn.Module):
+    def __init__(self, n_embd, expert_dim):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embd, expert_dim, bias=False)
+        self.fc2 = nn.Linear(expert_dim, n_embd, bias=False)
+    def forward(self, x):
+        return self.fc2(F.relu(self.fc1(x)).pow(2))
+
+class MoELayer(nn.Module):
+    def __init__(self, c):
+        super().__init__()
+        self.n_experts = c.n_experts
+        self.top_k     = c.moe_top_k
+        self.router    = nn.Linear(c.n_embd, c.n_experts, bias=False)
+        self.experts   = nn.ModuleList([
+            MoEExpert(c.n_embd, c.expert_dim) for _ in range(c.n_experts)
+        ])
+    def forward(self, x):
+        B, T, D = x.shape
+        x_flat = x.view(B * T, D)
+        logits = self.router(x_flat)
+        probs  = F.softmax(logits, dim=-1)
+        top_vals, top_idx = probs.topk(self.top_k, dim=-1)
+        top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            for e in range(self.n_experts):
+                mask = (top_idx[:, k] == e)
+                if mask.any():
+                    expert_out = self.experts[e](x_flat[mask])
+                    out[mask] += top_vals[mask, k:k+1] * expert_out
+        return out.view(B, T, D)
+
 class Block(nn.Module):
     def __init__(self, c):
         super().__init__()
         self.attn = Attn(c)
-        self.mlp  = MLP(c)
+        if c.n_experts > 0:
+            self.moe = MoELayer(c)
+        else:
+            self.mlp = MLP(c)
     def forward(self, x):
         x = x + self.attn(rmsnorm(x))
-        return x + self.mlp(rmsnorm(x))
+        ffn = self.moe if hasattr(self, 'moe') else self.mlp
+        return x + ffn(rmsnorm(x))
 
 class RandyGPT(nn.Module):
     def __init__(self, c):

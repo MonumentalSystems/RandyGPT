@@ -78,6 +78,16 @@ pub const HEAD_DIM:   usize = N_EMBD / N_HEAD;
 pub const MLP_DIM:    usize = 4 * N_EMBD;
 pub const MAX_VOCAB:  usize = 8192;   // raised for BPE (char-level uses ~117)
 
+// ── MoE (Mixture of Experts) ────────────────────────────────────────────
+#[cfg(feature = "moe")]
+pub const N_EXPERTS: usize = 4;
+#[cfg(feature = "moe")]
+pub const MOE_TOP_K: usize = 2;
+#[cfg(feature = "moe")]
+pub const EXPERT_DIM: usize = N_EMBD * 2;  // half of MLP_DIM (256 for DS)
+#[cfg(feature = "moe")]
+pub const MOE_AUX_LOSS_COEF: f32 = 0.01;   // load-balancing loss weight
+
 // ── BPE tokenizer ─────────────────────────────────────────────────────────
 pub const BPE_VOCAB_SIZE: usize = 2000; // default target vocab for --bpe mode
 pub const BPE_VOCAB_PATH: &str  = "vocab.json";

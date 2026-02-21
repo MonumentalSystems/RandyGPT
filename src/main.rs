@@ -15,7 +15,11 @@ use std::io::{BufRead, BufReader, Read as _, Write as _};
 use std::path::Path;
 use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 
-use checkpoint::{load_checkpoint, load_checkpoint_cpu, load_checkpoint_v2, load_checkpoint_v3};
+use checkpoint::{load_checkpoint, load_checkpoint_cpu};
+#[cfg(not(feature = "moe"))]
+use checkpoint::{load_checkpoint_v2, load_checkpoint_v3};
+#[cfg(feature = "moe")]
+use checkpoint::load_checkpoint_v4;
 use config::*;
 use metal::METAL_DEVICE;
 use model::{CandleModel, GPTModel};
@@ -296,15 +300,23 @@ fn main() -> std::io::Result<()> {
         println!("LR override: {} → {}", lr, min_lr);
     }
 
-    let model_size_name = if cfg!(feature = "model-s")    { "S (~1.6M)"    }
-                          else if cfg!(feature = "model-ds")   { "DS (~2.78M)"  }
-                          else if cfg!(feature = "model-m")    { "M (~2.7M)"    }
-                          else if cfg!(feature = "model-l")    { "L (~4.82M)"   }
-                          else if cfg!(feature = "model-deep") { "Deep (~7.5M)" }
-                          else if cfg!(feature = "model-xl")   { "XL (~10.8M)"  }
-                          else                                 { "XS (~0.86M)"  };
+    let base_model = if cfg!(feature = "model-s")    { "S"    }
+                     else if cfg!(feature = "model-ds")   { "DS"   }
+                     else if cfg!(feature = "model-m")    { "M"    }
+                     else if cfg!(feature = "model-l")    { "L"    }
+                     else if cfg!(feature = "model-deep") { "Deep" }
+                     else if cfg!(feature = "model-xl")   { "XL"   }
+                     else                                 { "XS"   };
+    let model_size_name = if cfg!(feature = "moe") {
+        format!("{}-MoE", base_model)
+    } else {
+        base_model.to_string()
+    };
     println!("=== Enhanced randyGPT ===");
     println!("Model: {} — {} layers, {} heads, {}-dim", model_size_name, N_LAYER, N_HEAD, N_EMBD);
+    #[cfg(feature = "moe")]
+    println!("MoE: {} experts, top-{}, expert_dim={}, aux_coef={}",
+        N_EXPERTS, MOE_TOP_K, EXPERT_DIM, MOE_AUX_LOSS_COEF);
     println!("Block size: {}, Vocab size: up to {}", BLOCK_SIZE, MAX_VOCAB);
     println!();
 
@@ -336,12 +348,7 @@ fn main() -> std::io::Result<()> {
 
         // Load model + checkpoint
         let mut model = GPTModel::new(tokenizer.vocab_size, &mut rng);
-        let param_count = model.wte.len() + model.wpe.len() + model.lm_head.len()
-            + N_LAYER * (
-                model.layers[0].wq.len() + model.layers[0].wk.len()
-                + model.layers[0].wv.len() + model.layers[0].wo.len()
-                + model.layers[0].fc1.len() + model.layers[0].fc2.len()
-            );
+        let param_count = model.param_count();
         println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
 
         if let Some(ref path) = resume_path {
@@ -396,12 +403,7 @@ fn main() -> std::io::Result<()> {
         println!();
 
         let mut model = GPTModel::new(tokenizer.vocab_size, &mut rng);
-        let param_count = model.wte.len() + model.wpe.len() + model.lm_head.len()
-            + N_LAYER * (
-                model.layers[0].wq.len() + model.layers[0].wk.len()
-                + model.layers[0].wv.len() + model.layers[0].wo.len()
-                + model.layers[0].fc1.len() + model.layers[0].fc2.len()
-            );
+        let param_count = model.param_count();
         println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
 
         if let Some(ref path) = resume_path {
@@ -549,12 +551,7 @@ fn main() -> std::io::Result<()> {
     println!("Initializing model...");
     let mut model = GPTModel::new(tokenizer.vocab_size, &mut rng);
 
-    let param_count = model.wte.len() + model.wpe.len() + model.lm_head.len()
-        + N_LAYER * (
-            model.layers[0].wq.len() + model.layers[0].wk.len()
-            + model.layers[0].wv.len() + model.layers[0].wo.len()
-            + model.layers[0].fc1.len() + model.layers[0].fc2.len()
-        );
+    let param_count = model.param_count();
     println!("Parameters: ~{:.2}M", param_count as f32 / 1_000_000.0);
     println!();
 
@@ -564,6 +561,13 @@ fn main() -> std::io::Result<()> {
         println!("Metal GPU: enabled — training via Candle autograd");
     } else {
         println!("Metal GPU: unavailable — training on CPU (BLAS)");
+    }
+    #[cfg(feature = "moe")]
+    {
+        if !use_metal {
+            eprintln!("Error: MoE training requires Metal GPU. CPU-only is not supported.");
+            return Ok(());
+        }
     }
     println!();
 
@@ -580,35 +584,52 @@ fn main() -> std::io::Result<()> {
         let result: std::io::Result<(usize, usize, f32)> = if use_metal {
             let device = METAL_DEVICE.as_ref().unwrap();
 
-            // Try RGPT0003 (full GPU state)
-            let r3 = {
+            #[cfg(feature = "moe")]
+            {
+                // MoE: only RGPT0004 format supported
                 let mut cm = CandleModel::from_gpt(&model, device)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
                 let vars = cm.all_vars();
                 let mut opt = GpuAdamState::new(&vars)
                     .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                load_checkpoint_v3(ckpt, &mut cm, &mut opt).map(|(it, st, bl)| {
+                load_checkpoint_v4(ckpt, &mut cm, &mut opt).map(|(it, st, bl)| {
                     candle_resume = Some((cm, opt, it, st, bl));
                     (it, st, bl)
                 })
-            };
+            }
 
-            if r3.is_ok() {
-                r3
-            } else {
-                // Try RGPT0002 (weights only, moments reset to zero)
-                let r2 = {
+            #[cfg(not(feature = "moe"))]
+            {
+                // Dense: try RGPT0003 (full GPU state)
+                let r3 = {
                     let mut cm = CandleModel::from_gpt(&model, device)
                         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
-                    load_checkpoint_v2(ckpt, &mut cm).map(|(it, st, bl)| {
-                        let vars = cm.all_vars();
-                        let opt = GpuAdamState::new(&vars)
-                            .expect("GpuAdamState init failed");
+                    let vars = cm.all_vars();
+                    let mut opt = GpuAdamState::new(&vars)
+                        .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                    load_checkpoint_v3(ckpt, &mut cm, &mut opt).map(|(it, st, bl)| {
                         candle_resume = Some((cm, opt, it, st, bl));
                         (it, st, bl)
                     })
                 };
-                if r2.is_ok() { r2 } else { load_checkpoint(ckpt, &mut model) }
+
+                if r3.is_ok() {
+                    r3
+                } else {
+                    // Try RGPT0002 (weights only, moments reset to zero)
+                    let r2 = {
+                        let mut cm = CandleModel::from_gpt(&model, device)
+                            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+                        load_checkpoint_v2(ckpt, &mut cm).map(|(it, st, bl)| {
+                            let vars = cm.all_vars();
+                            let opt = GpuAdamState::new(&vars)
+                                .expect("GpuAdamState init failed");
+                            candle_resume = Some((cm, opt, it, st, bl));
+                            (it, st, bl)
+                        })
+                    };
+                    if r2.is_ok() { r2 } else { load_checkpoint(ckpt, &mut model) }
+                }
             }
         } else {
             load_checkpoint(ckpt, &mut model)

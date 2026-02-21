@@ -21,8 +21,9 @@ CHECKPOINT="${2:-checkpoint_best.bin}"
 FORCE_RESTART=false
 # Default vocab: ds2 uses vocab_v3.json; all others use vocab.json
 case "${MODEL_SIZE}" in
-    ds2) VOCAB="vocab_v3.json" ;;
-    *)   VOCAB="vocab.json" ;;
+    ds2)    VOCAB="vocab_v3.json" ;;
+    ds-moe) VOCAB="vocab_v3.json" ;;
+    *)      VOCAB="vocab.json" ;;
 esac
 args=("$@")
 for ((i=0; i<${#args[@]}; i++)); do

@@ -50,11 +50,19 @@ pub struct LayerWeights {
     pub wv: Vec<f32>,
     pub wo: Vec<f32>,
 
-    // MLP projections
+    // MLP projections (zero-length when moe feature is active)
     pub fc1: Vec<f32>,
     pub fc2: Vec<f32>,
 
-    // Gradients
+    // MoE weights
+    #[cfg(feature = "moe")]
+    pub router: Vec<f32>,              // [N_EXPERTS × N_EMBD]
+    #[cfg(feature = "moe")]
+    pub expert_fc1: Vec<Vec<f32>>,     // N_EXPERTS entries, each [EXPERT_DIM × N_EMBD]
+    #[cfg(feature = "moe")]
+    pub expert_fc2: Vec<Vec<f32>>,     // N_EXPERTS entries, each [N_EMBD × EXPERT_DIM]
+
+    // Gradients (CPU training path — unused for MoE which trains via Candle)
     pub d_wq: Vec<f32>,
     pub d_wk: Vec<f32>,
     pub d_wv: Vec<f32>,
@@ -62,7 +70,7 @@ pub struct LayerWeights {
     pub d_fc1: Vec<f32>,
     pub d_fc2: Vec<f32>,
 
-    // Adam moments
+    // Adam moments (CPU training path — unused for MoE)
     pub m_wq: Vec<f32>, pub v_wq: Vec<f32>,
     pub m_wk: Vec<f32>, pub v_wk: Vec<f32>,
     pub m_wv: Vec<f32>, pub v_wv: Vec<f32>,
@@ -82,28 +90,63 @@ impl LayerWeights {
         let std_in  = 0.02;
         let std_out = 0.02 / (2.0 * N_LAYER as f32).sqrt();
 
+        // fc1/fc2 are zero-length when MoE is active (experts replace the MLP)
+        #[cfg(not(feature = "moe"))]
+        let mlp_sz = MLP_DIM * N_EMBD;
+        #[cfg(feature = "moe")]
+        let mlp_sz = 0usize;
+
         Self {
             wq: make_params(N_EMBD * N_EMBD, std_in),
             wk: make_params(N_EMBD * N_EMBD, std_in),
             wv: make_params(N_EMBD * N_EMBD, std_in),
             wo: make_params(N_EMBD * N_EMBD, std_out),
+
+            #[cfg(not(feature = "moe"))]
             fc1: make_params(MLP_DIM * N_EMBD, std_in),
+            #[cfg(not(feature = "moe"))]
             fc2: make_params(N_EMBD * MLP_DIM, std_out),
+            #[cfg(feature = "moe")]
+            fc1: Vec::new(),
+            #[cfg(feature = "moe")]
+            fc2: Vec::new(),
+
+            #[cfg(feature = "moe")]
+            router: make_params(N_EXPERTS * N_EMBD, std_in),
+            #[cfg(feature = "moe")]
+            expert_fc1: (0..N_EXPERTS).map(|_| make_params(EXPERT_DIM * N_EMBD, std_in)).collect(),
+            #[cfg(feature = "moe")]
+            expert_fc2: (0..N_EXPERTS).map(|_| make_params(N_EMBD * EXPERT_DIM, std_out)).collect(),
 
             d_wq:  zeros(N_EMBD * N_EMBD),
             d_wk:  zeros(N_EMBD * N_EMBD),
             d_wv:  zeros(N_EMBD * N_EMBD),
             d_wo:  zeros(N_EMBD * N_EMBD),
-            d_fc1: zeros(MLP_DIM * N_EMBD),
-            d_fc2: zeros(N_EMBD * MLP_DIM),
+            d_fc1: zeros(mlp_sz),
+            d_fc2: zeros(mlp_sz),
 
             m_wq: zeros(N_EMBD * N_EMBD), v_wq: zeros(N_EMBD * N_EMBD),
             m_wk: zeros(N_EMBD * N_EMBD), v_wk: zeros(N_EMBD * N_EMBD),
             m_wv: zeros(N_EMBD * N_EMBD), v_wv: zeros(N_EMBD * N_EMBD),
             m_wo: zeros(N_EMBD * N_EMBD), v_wo: zeros(N_EMBD * N_EMBD),
-            m_fc1: zeros(MLP_DIM * N_EMBD), v_fc1: zeros(MLP_DIM * N_EMBD),
-            m_fc2: zeros(N_EMBD * MLP_DIM), v_fc2: zeros(N_EMBD * MLP_DIM),
+            m_fc1: zeros(mlp_sz), v_fc1: zeros(mlp_sz),
+            m_fc2: zeros(mlp_sz), v_fc2: zeros(mlp_sz),
         }
+    }
+}
+
+impl GPTModel {
+    pub fn param_count(&self) -> usize {
+        let attn_per_layer = self.layers[0].wq.len() + self.layers[0].wk.len()
+            + self.layers[0].wv.len() + self.layers[0].wo.len();
+        #[cfg(not(feature = "moe"))]
+        let mlp_per_layer = self.layers[0].fc1.len() + self.layers[0].fc2.len();
+        #[cfg(feature = "moe")]
+        let mlp_per_layer = self.layers[0].router.len()
+            + self.layers[0].expert_fc1.iter().map(|e| e.len()).sum::<usize>()
+            + self.layers[0].expert_fc2.iter().map(|e| e.len()).sum::<usize>();
+        self.wte.len() + self.wpe.len() + self.lm_head.len()
+            + N_LAYER * (attn_per_layer + mlp_per_layer)
     }
 }
 
@@ -210,7 +253,16 @@ pub fn var_to_vec(v: &Var) -> CResult<Vec<f32>> {
 /// Weights-only layer — moments are owned by GpuAdamState (v0.8.5+)
 pub struct CandleLayer {
     pub wq: Var, pub wk: Var, pub wv: Var, pub wo: Var,
-    pub fc1: Var, pub fc2: Var,
+    #[cfg(not(feature = "moe"))]
+    pub fc1: Var,
+    #[cfg(not(feature = "moe"))]
+    pub fc2: Var,
+    #[cfg(feature = "moe")]
+    pub router: Var,                    // [N_EXPERTS, N_EMBD]
+    #[cfg(feature = "moe")]
+    pub expert_fc1: Vec<Var>,           // N_EXPERTS of [EXPERT_DIM, N_EMBD]
+    #[cfg(feature = "moe")]
+    pub expert_fc2: Vec<Var>,           // N_EXPERTS of [N_EMBD, EXPERT_DIM]
 }
 
 /// Weights-only model — moments are owned by GpuAdamState (v0.8.5+)
@@ -233,8 +285,20 @@ impl CandleModel {
                 wk:  make_var(&l.wk,  (N_EMBD, N_EMBD), device)?,
                 wv:  make_var(&l.wv,  (N_EMBD, N_EMBD), device)?,
                 wo:  make_var(&l.wo,  (N_EMBD, N_EMBD), device)?,
+                #[cfg(not(feature = "moe"))]
                 fc1: make_var(&l.fc1, (MLP_DIM, N_EMBD), device)?,
+                #[cfg(not(feature = "moe"))]
                 fc2: make_var(&l.fc2, (N_EMBD, MLP_DIM), device)?,
+                #[cfg(feature = "moe")]
+                router: make_var(&l.router, (N_EXPERTS, N_EMBD), device)?,
+                #[cfg(feature = "moe")]
+                expert_fc1: (0..N_EXPERTS).map(|e|
+                    make_var(&l.expert_fc1[e], (EXPERT_DIM, N_EMBD), device)
+                ).collect::<CResult<Vec<_>>>()?,
+                #[cfg(feature = "moe")]
+                expert_fc2: (0..N_EXPERTS).map(|e|
+                    make_var(&l.expert_fc2[e], (N_EMBD, EXPERT_DIM), device)
+                ).collect::<CResult<Vec<_>>>()?,
             })
         }).collect::<CResult<Vec<_>>>()?;
 
@@ -264,17 +328,33 @@ impl CandleModel {
             gpt.layers[li].wk  = var_to_vec(&cl.wk)?;
             gpt.layers[li].wv  = var_to_vec(&cl.wv)?;
             gpt.layers[li].wo  = var_to_vec(&cl.wo)?;
-            gpt.layers[li].fc1 = var_to_vec(&cl.fc1)?;
-            gpt.layers[li].fc2 = var_to_vec(&cl.fc2)?;
+            #[cfg(not(feature = "moe"))]
+            {
+                gpt.layers[li].fc1 = var_to_vec(&cl.fc1)?;
+                gpt.layers[li].fc2 = var_to_vec(&cl.fc2)?;
+            }
+            #[cfg(feature = "moe")]
+            {
+                gpt.layers[li].router = var_to_vec(&cl.router)?;
+                gpt.layers[li].expert_fc1 = cl.expert_fc1.iter()
+                    .map(|v| var_to_vec(v)).collect::<CResult<Vec<_>>>()?;
+                gpt.layers[li].expert_fc2 = cl.expert_fc2.iter()
+                    .map(|v| var_to_vec(v)).collect::<CResult<Vec<_>>>()?;
+            }
         }
         Ok(gpt)
     }
 
     /// All weight Vars in canonical order:
-    /// wte, wpe, lm_head, then per-layer wq/wk/wv/wo/fc1/fc2.
+    /// wte, wpe, lm_head, then per-layer wq/wk/wv/wo + MLP or MoE weights.
     /// GpuAdamState is constructed and indexed using this same order.
     pub fn all_vars(&self) -> Vec<Var> {
-        let mut vars = Vec::with_capacity(3 + N_LAYER * 6);
+        #[cfg(not(feature = "moe"))]
+        let vars_per_layer = 6; // wq,wk,wv,wo,fc1,fc2
+        #[cfg(feature = "moe")]
+        let vars_per_layer = 4 + 1 + 2 * N_EXPERTS; // wq,wk,wv,wo + router + expert_fc1/fc2
+
+        let mut vars = Vec::with_capacity(3 + N_LAYER * vars_per_layer);
         vars.push(self.wte.clone());
         vars.push(self.wpe.clone());
         vars.push(self.lm_head.clone());
@@ -283,8 +363,19 @@ impl CandleModel {
             vars.push(l.wk.clone());
             vars.push(l.wv.clone());
             vars.push(l.wo.clone());
-            vars.push(l.fc1.clone());
-            vars.push(l.fc2.clone());
+            #[cfg(not(feature = "moe"))]
+            {
+                vars.push(l.fc1.clone());
+                vars.push(l.fc2.clone());
+            }
+            #[cfg(feature = "moe")]
+            {
+                vars.push(l.router.clone());
+                for e in 0..N_EXPERTS {
+                    vars.push(l.expert_fc1[e].clone());
+                    vars.push(l.expert_fc2[e].clone());
+                }
+            }
         }
         vars
     }

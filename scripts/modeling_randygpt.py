@@ -4,7 +4,8 @@ modeling_randygpt.py — PyTorch implementation of the randyGPT architecture.
 Matches the Rust forward pass exactly:
   - RMSNorm with no learnable parameters (x / rms(x))
   - Multi-head causal self-attention (no bias, scaled dot-product)
-  - MLP with squared-ReLU activation and 4× expansion
+  - MLP with squared-ReLU activation and 4× expansion (dense mode)
+  - MoE layer with top-k expert routing and squared-ReLU experts (MoE mode)
   - No final layer norm before lm_head
   - Learned token + position embeddings
 
@@ -48,13 +49,16 @@ class RandyGPTConfig(PretrainedConfig):
         **kwargs,
     ):
         super().__init__(bos_token_id=bos_token_id, eos_token_id=eos_token_id, **kwargs)
-        self.vocab_size = vocab_size
-        self.n_embd     = n_embd
-        self.n_head     = n_head
-        self.n_layer    = n_layer
-        self.block_size = block_size
-        self.head_dim   = n_embd // n_head
-        self.mlp_dim    = 4 * n_embd
+        self.vocab_size  = vocab_size
+        self.n_embd      = n_embd
+        self.n_head      = n_head
+        self.n_layer     = n_layer
+        self.block_size  = block_size
+        self.head_dim    = n_embd // n_head
+        self.mlp_dim     = 4 * n_embd
+        self.n_experts   = kwargs.get("n_experts", 0)    # 0 = dense
+        self.expert_dim  = kwargs.get("expert_dim", 0)
+        self.moe_top_k   = kwargs.get("moe_top_k", 0)
 
 
 # ── Modules ───────────────────────────────────────────────────────────────────
@@ -108,15 +112,57 @@ class MLP(nn.Module):
         return self.fc2(h)
 
 
+class MoEExpert(nn.Module):
+    def __init__(self, n_embd: int, expert_dim: int):
+        super().__init__()
+        self.fc1 = nn.Linear(n_embd, expert_dim, bias=False)
+        self.fc2 = nn.Linear(expert_dim, n_embd, bias=False)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.fc2(F.relu(self.fc1(x)).pow(2))
+
+
+class MoELayer(nn.Module):
+    def __init__(self, cfg: RandyGPTConfig):
+        super().__init__()
+        self.n_experts = cfg.n_experts
+        self.top_k     = cfg.moe_top_k
+        self.router    = nn.Linear(cfg.n_embd, cfg.n_experts, bias=False)
+        self.experts   = nn.ModuleList([
+            MoEExpert(cfg.n_embd, cfg.expert_dim) for _ in range(cfg.n_experts)
+        ])
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        B, T, D = x.shape
+        x_flat = x.view(B * T, D)
+        logits = self.router(x_flat)                         # [B*T, n_experts]
+        probs  = F.softmax(logits, dim=-1)                   # [B*T, n_experts]
+        top_vals, top_idx = probs.topk(self.top_k, dim=-1)   # [B*T, top_k]
+        top_vals = top_vals / top_vals.sum(dim=-1, keepdim=True)  # renormalize
+
+        out = torch.zeros_like(x_flat)
+        for k in range(self.top_k):
+            for e in range(self.n_experts):
+                mask = (top_idx[:, k] == e)
+                if mask.any():
+                    expert_out = self.experts[e](x_flat[mask])
+                    out[mask] += top_vals[mask, k:k+1] * expert_out
+        return out.view(B, T, D)
+
+
 class TransformerBlock(nn.Module):
     def __init__(self, cfg: RandyGPTConfig):
         super().__init__()
         self.attn = CausalSelfAttention(cfg)
-        self.mlp  = MLP(cfg)
+        if cfg.n_experts > 0:
+            self.moe = MoELayer(cfg)
+        else:
+            self.mlp = MLP(cfg)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = x + self.attn(rmsnorm(x))   # pre-norm attention + residual
-        x = x + self.mlp(rmsnorm(x))    # pre-norm MLP + residual
+        ffn = self.moe if hasattr(self, 'moe') else self.mlp
+        x = x + ffn(rmsnorm(x))         # pre-norm FFN + residual
         return x
 
 

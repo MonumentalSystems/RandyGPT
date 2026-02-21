@@ -170,8 +170,9 @@ pub fn load_checkpoint(
     Ok((iter + 1, step, best_loss))
 }
 
-/// Load weights from any checkpoint format (v1/v2/v3) into a CPU GPTModel.
+/// Load weights from any checkpoint format into a CPU GPTModel.
 /// Ignores optimizer moments. Useful for --generate mode.
+/// Supports v1/v2/v3 (dense) and v4 (MoE, when moe feature is active).
 pub fn load_checkpoint_cpu(
     path: &str,
     model: &mut GPTModel,
@@ -180,48 +181,96 @@ pub fn load_checkpoint_cpu(
 
     let mut magic = [0u8; 8];
     f.read_exact(&mut magic)?;
-    if &magic != b"RGPT0001" && &magic != b"RGPT0002" && &magic != b"RGPT0003" {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Unknown checkpoint format in '{}': {:?}", path, magic),
-        ));
+
+    #[cfg(feature = "moe")]
+    {
+        if &magic != b"RGPT0004" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("MoE model requires RGPT0004 checkpoint, got {:?} in '{}'", magic, path),
+            ));
+        }
+
+        let mut u32buf = [0u8; 4];
+        f.read_exact(&mut u32buf)?; let ckpt_vocab  = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let iter        = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let step        = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let best_loss   = f32::from_le_bytes(u32buf);
+        f.read_exact(&mut u32buf)?; let _n_experts  = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let _expert_dim = u32::from_le_bytes(u32buf) as usize;
+
+        if ckpt_vocab != model.vocab_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
+            ));
+        }
+
+        model.wte     = read_f32_slice(&mut f, model.wte.len())?;
+        model.wpe     = read_f32_slice(&mut f, model.wpe.len())?;
+        model.lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+        for li in 0..N_LAYER {
+            let n_sq = N_EMBD * N_EMBD;
+            model.layers[li].wq     = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wk     = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wv     = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wo     = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].router = read_f32_slice(&mut f, N_EXPERTS * N_EMBD)?;
+            for e in 0..N_EXPERTS {
+                model.layers[li].expert_fc1[e] = read_f32_slice(&mut f, EXPERT_DIM * N_EMBD)?;
+                model.layers[li].expert_fc2[e] = read_f32_slice(&mut f, N_EMBD * EXPERT_DIM)?;
+            }
+        }
+
+        return Ok((iter + 1, step, best_loss));
     }
 
-    let mut u32buf = [0u8; 4];
-    f.read_exact(&mut u32buf)?; let ckpt_vocab = u32::from_le_bytes(u32buf) as usize;
-    f.read_exact(&mut u32buf)?; let iter       = u32::from_le_bytes(u32buf) as usize;
-    f.read_exact(&mut u32buf)?; let step       = u32::from_le_bytes(u32buf) as usize;
-    f.read_exact(&mut u32buf)?; let best_loss  = f32::from_le_bytes(u32buf);
+    #[cfg(not(feature = "moe"))]
+    {
+        if &magic != b"RGPT0001" && &magic != b"RGPT0002" && &magic != b"RGPT0003" {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Unknown checkpoint format in '{}': {:?}", path, magic),
+            ));
+        }
 
-    if ckpt_vocab != model.vocab_size {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
-        ));
+        let mut u32buf = [0u8; 4];
+        f.read_exact(&mut u32buf)?; let ckpt_vocab = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let iter       = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let step       = u32::from_le_bytes(u32buf) as usize;
+        f.read_exact(&mut u32buf)?; let best_loss  = f32::from_le_bytes(u32buf);
+
+        if ckpt_vocab != model.vocab_size {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
+            ));
+        }
+
+        // Weight layout is identical across v1/v2/v3
+        model.wte     = read_f32_slice(&mut f, model.wte.len())?;
+        model.wpe     = read_f32_slice(&mut f, model.wpe.len())?;
+        model.lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
+        for li in 0..N_LAYER {
+            let n_sq = N_EMBD * N_EMBD;
+            model.layers[li].wq  = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wk  = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wv  = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].wo  = read_f32_slice(&mut f, n_sq)?;
+            model.layers[li].fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
+            model.layers[li].fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
+        }
+        // Skip moments — not needed for inference
+
+        Ok((iter + 1, step, best_loss))
     }
-
-    // Weight layout is identical across v1/v2/v3
-    model.wte     = read_f32_slice(&mut f, model.wte.len())?;
-    model.wpe     = read_f32_slice(&mut f, model.wpe.len())?;
-    model.lm_head = read_f32_slice(&mut f, model.lm_head.len())?;
-    for li in 0..N_LAYER {
-        let n_sq = N_EMBD * N_EMBD;
-        model.layers[li].wq  = read_f32_slice(&mut f, n_sq)?;
-        model.layers[li].wk  = read_f32_slice(&mut f, n_sq)?;
-        model.layers[li].wv  = read_f32_slice(&mut f, n_sq)?;
-        model.layers[li].wo  = read_f32_slice(&mut f, n_sq)?;
-        model.layers[li].fc1 = read_f32_slice(&mut f, MLP_DIM * N_EMBD)?;
-        model.layers[li].fc2 = read_f32_slice(&mut f, N_EMBD * MLP_DIM)?;
-    }
-    // Skip moments — not needed for inference
-
-    Ok((iter + 1, step, best_loss))
 }
 
 // ── RGPT0002: CandleModel checkpoint (same binary layout, new magic) ──
 
 /// Serialize a CandleModel to in-memory bytes (RGPT0002 format).
 /// Kept for potential use; production code writes RGPT0003 via serialize_checkpoint_v3.
+#[cfg(not(feature = "moe"))]
 #[allow(dead_code)]
 pub fn serialize_checkpoint_v2(
     model: &CandleModel,
@@ -258,6 +307,7 @@ pub fn serialize_checkpoint_v2(
 }
 
 /// Load an RGPT0002 checkpoint into a CandleModel.
+#[cfg(not(feature = "moe"))]
 pub fn load_checkpoint_v2(
     path: &str,
     model: &mut CandleModel,
@@ -333,6 +383,7 @@ pub fn load_checkpoint_v2(
 //            Adam second moments (v), same order
 
 /// Serialize CandleModel + GpuAdamState to in-memory bytes (RGPT0003 format).
+#[cfg(not(feature = "moe"))]
 pub fn serialize_checkpoint_v3(
     model: &CandleModel,
     opt:   &GpuAdamState,
@@ -376,6 +427,7 @@ pub fn serialize_checkpoint_v3(
 
 /// Load an RGPT0003 checkpoint into a CandleModel and GpuAdamState.
 /// Returns (iter+1, step, best_loss).
+#[cfg(not(feature = "moe"))]
 pub fn load_checkpoint_v3(
     path:  &str,
     model: &mut CandleModel,
@@ -431,6 +483,163 @@ pub fn load_checkpoint_v3(
     }
 
     // Load Adam moments — shapes mirror all_vars() order
+    let vars = model.all_vars();
+    let n = vars.len();
+    let mut m_new: Vec<Var> = Vec::with_capacity(n);
+    let mut v_new: Vec<Var> = Vec::with_capacity(n);
+
+    for var in &vars {
+        let sz = var.as_tensor().elem_count();
+        let data = read_f32_slice(&mut f, sz)?;
+        let t = Tensor::from_slice(&data, var.shape(), device)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        m_new.push(Var::from_tensor(&t)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?);
+    }
+    for var in &vars {
+        let sz = var.as_tensor().elem_count();
+        let data = read_f32_slice(&mut f, sz)?;
+        let t = Tensor::from_slice(&data, var.shape(), device)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+        v_new.push(Var::from_tensor(&t)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?);
+    }
+
+    opt.m = m_new;
+    opt.v = v_new;
+    opt.step_t = step;
+
+    Ok((iter + 1, step, best_loss))
+}
+
+// ── RGPT0004: MoE checkpoint (CandleModel + GpuAdamState) ─────────────────
+//
+// Layout (little-endian):
+//   [0..8)   "RGPT0004"
+//   [8..12)  vocab_size (u32)
+//   [12..16) iter       (u32)
+//   [16..20) step       (u32)
+//   [20..24) best_loss  (f32)
+//   [24..28) n_experts  (u32)
+//   [28..32) expert_dim (u32)
+//   [32..)   Weights in all_vars() order:
+//              wte, wpe, lm_head,
+//              [N_LAYER × wq wk wv wo router expert_fc1[0] expert_fc2[0] ... expert_fc1[N-1] expert_fc2[N-1]]
+//            Adam first moments (m), same order
+//            Adam second moments (v), same order
+
+#[cfg(feature = "moe")]
+pub fn serialize_checkpoint_v4(
+    model: &CandleModel,
+    opt:   &GpuAdamState,
+    iter: usize,
+    step: usize,
+    best_loss: f32,
+) -> Vec<u8> {
+    let pull = |v: &candle_core::Var| -> Vec<f32> {
+        var_to_vec(v).unwrap_or_default()
+    };
+
+    let mut buf: Vec<u8> = Vec::new();
+    buf.extend_from_slice(b"RGPT0004");
+    buf.extend_from_slice(&(model.vocab_size as u32).to_le_bytes());
+    buf.extend_from_slice(&(iter as u32).to_le_bytes());
+    buf.extend_from_slice(&(step as u32).to_le_bytes());
+    buf.extend_from_slice(&best_loss.to_le_bytes());
+    buf.extend_from_slice(&(N_EXPERTS as u32).to_le_bytes());
+    buf.extend_from_slice(&(EXPERT_DIM as u32).to_le_bytes());
+
+    // Weights in all_vars() order
+    write_f32s(&mut buf, &pull(&model.wte));
+    write_f32s(&mut buf, &pull(&model.wpe));
+    write_f32s(&mut buf, &pull(&model.lm_head));
+    for l in &model.layers {
+        write_f32s(&mut buf, &pull(&l.wq));
+        write_f32s(&mut buf, &pull(&l.wk));
+        write_f32s(&mut buf, &pull(&l.wv));
+        write_f32s(&mut buf, &pull(&l.wo));
+        write_f32s(&mut buf, &pull(&l.router));
+        for e in 0..N_EXPERTS {
+            write_f32s(&mut buf, &pull(&l.expert_fc1[e]));
+            write_f32s(&mut buf, &pull(&l.expert_fc2[e]));
+        }
+    }
+    // Adam first moments
+    for m in &opt.m { write_f32s(&mut buf, &pull(m)); }
+    // Adam second moments
+    for v in &opt.v { write_f32s(&mut buf, &pull(v)); }
+
+    buf
+}
+
+#[cfg(feature = "moe")]
+pub fn load_checkpoint_v4(
+    path:  &str,
+    model: &mut CandleModel,
+    opt:   &mut GpuAdamState,
+) -> std::io::Result<(usize, usize, f32)> {
+    use candle_core::{Tensor, Var};
+
+    let mut f = File::open(path)?;
+
+    let mut magic = [0u8; 8];
+    f.read_exact(&mut magic)?;
+    if &magic != b"RGPT0004" {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Expected RGPT0004 magic in '{}', got {:?}", path, magic),
+        ));
+    }
+
+    let mut u32buf = [0u8; 4];
+    f.read_exact(&mut u32buf)?; let ckpt_vocab  = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let iter        = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let step        = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let best_loss   = f32::from_le_bytes(u32buf);
+    f.read_exact(&mut u32buf)?; let n_experts   = u32::from_le_bytes(u32buf) as usize;
+    f.read_exact(&mut u32buf)?; let expert_dim  = u32::from_le_bytes(u32buf) as usize;
+
+    if ckpt_vocab != model.vocab_size {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Checkpoint vocab {} != model vocab {}", ckpt_vocab, model.vocab_size),
+        ));
+    }
+    if n_experts != N_EXPERTS || expert_dim != EXPERT_DIM {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Checkpoint MoE config ({} experts, dim={}) != model ({}, {})",
+                    n_experts, expert_dim, N_EXPERTS, EXPERT_DIM),
+        ));
+    }
+
+    let device = &model.device.clone();
+    let upload = |f: &mut File, n: usize, shape: (usize, usize)| -> std::io::Result<Var> {
+        let data = read_f32_slice(f, n)?;
+        Var::from_tensor(
+            &Tensor::from_slice(&data, shape, device)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?
+        ).map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))
+    };
+
+    // Load weights
+    model.wte     = upload(&mut f, model.vocab_size * N_EMBD, (model.vocab_size, N_EMBD))?;
+    model.wpe     = upload(&mut f, BLOCK_SIZE * N_EMBD,       (BLOCK_SIZE, N_EMBD))?;
+    model.lm_head = upload(&mut f, model.vocab_size * N_EMBD, (model.vocab_size, N_EMBD))?;
+    for li in 0..N_LAYER {
+        let n_sq = N_EMBD * N_EMBD;
+        model.layers[li].wq     = upload(&mut f, n_sq,                    (N_EMBD, N_EMBD))?;
+        model.layers[li].wk     = upload(&mut f, n_sq,                    (N_EMBD, N_EMBD))?;
+        model.layers[li].wv     = upload(&mut f, n_sq,                    (N_EMBD, N_EMBD))?;
+        model.layers[li].wo     = upload(&mut f, n_sq,                    (N_EMBD, N_EMBD))?;
+        model.layers[li].router = upload(&mut f, N_EXPERTS * N_EMBD,      (N_EXPERTS, N_EMBD))?;
+        for e in 0..N_EXPERTS {
+            model.layers[li].expert_fc1[e] = upload(&mut f, EXPERT_DIM * N_EMBD, (EXPERT_DIM, N_EMBD))?;
+            model.layers[li].expert_fc2[e] = upload(&mut f, N_EMBD * EXPERT_DIM, (N_EMBD, EXPERT_DIM))?;
+        }
+    }
+
+    // Load Adam moments (shapes mirror all_vars() order)
     let vars = model.all_vars();
     let n = vars.len();
     let mut m_new: Vec<Var> = Vec::with_capacity(n);

@@ -7,7 +7,11 @@ use std::time::Instant;
 use rayon::prelude::*;
 
 use candle_core::Tensor;
-use crate::checkpoint::{flush_checkpoint, serialize_checkpoint, serialize_checkpoint_v3};
+use crate::checkpoint::flush_checkpoint;
+#[cfg(not(feature = "moe"))]
+use crate::checkpoint::{serialize_checkpoint, serialize_checkpoint_v3};
+#[cfg(feature = "moe")]
+use crate::checkpoint::{serialize_checkpoint, serialize_checkpoint_v4};
 use crate::config::*;
 use crate::forward::{forward, forward_candle_train, forward_metal_logits};
 use crate::model::{CandleModel, GPTModel, GradientBuffer};
@@ -880,7 +884,10 @@ pub fn train_candle(
                 );
             }
 
-            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss);
+            #[cfg(feature = "moe")]
+            { ckpt_buf = serialize_checkpoint_v4(model, opt, iter, step, best_val_loss); }
+            #[cfg(not(feature = "moe"))]
+            { ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss); }
             // checkpoint_best tracks best VAL loss, not train loss
             if new_best || ckpt_best_buf.is_empty() {
                 ckpt_best_buf = ckpt_buf.clone();
@@ -913,7 +920,10 @@ pub fn train_candle(
 
         // ── Ctrl-C ────────────────────────────────────────────────────
         if ctrlc_flag.load(Ordering::Relaxed) {
-            ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss);
+            #[cfg(feature = "moe")]
+            { ckpt_buf = serialize_checkpoint_v4(model, opt, iter, step, best_val_loss); }
+            #[cfg(not(feature = "moe"))]
+            { ckpt_buf = serialize_checkpoint_v3(model, opt, iter, step, best_val_loss); }
             if ckpt_best_buf.is_empty() { ckpt_best_buf = ckpt_buf.clone(); }
             let elapsed = train_start.elapsed().as_secs_f32();
             let avg_ms  = if iter_count > 0 { total_iter_ms as f32 / iter_count as f32 } else { 0.0 };

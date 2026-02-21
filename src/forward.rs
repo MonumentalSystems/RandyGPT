@@ -108,25 +108,63 @@ pub fn forward(
             rmsnorm_fwd(&x, N_EMBD, &mut xn_mlp);
             act.xn_mlp[li] = xn_mlp.clone();
 
-            // fc1 → squared ReLU → fc2 → optional dropout → residual
-            let mut h1 = vec![0.0; MLP_DIM];
-            linear_fwd(&xn_mlp, &model.layers[li].fc1, MLP_DIM, N_EMBD, &mut h1);
-            act.mlp_pre[li] = h1.clone();
+            #[cfg(not(feature = "moe"))]
+            {
+                // fc1 → squared ReLU → fc2 → optional dropout → residual
+                let mut h1 = vec![0.0; MLP_DIM];
+                linear_fwd(&xn_mlp, &model.layers[li].fc1, MLP_DIM, N_EMBD, &mut h1);
+                act.mlp_pre[li] = h1.clone();
 
-            let mut h2 = vec![0.0; MLP_DIM];
-            for i in 0..MLP_DIM {
-                h2[i] = if h1[i] > 0.0 { h1[i] * h1[i] } else { 0.0 };
-            }
-            act.mlp_post[li] = h2.clone();
-
-            let mut mlp_out = vec![0.0; N_EMBD];
-            linear_fwd(&h2, &model.layers[li].fc2, N_EMBD, MLP_DIM, &mut mlp_out);
-            if training {
-                if let Some(r) = rng.as_deref_mut() {
-                    apply_dropout(&mut mlp_out, DROPOUT_RATE, r);
+                let mut h2 = vec![0.0; MLP_DIM];
+                for i in 0..MLP_DIM {
+                    h2[i] = if h1[i] > 0.0 { h1[i] * h1[i] } else { 0.0 };
                 }
+                act.mlp_post[li] = h2.clone();
+
+                let mut mlp_out = vec![0.0; N_EMBD];
+                linear_fwd(&h2, &model.layers[li].fc2, N_EMBD, MLP_DIM, &mut mlp_out);
+                if training {
+                    if let Some(r) = rng.as_deref_mut() {
+                        apply_dropout(&mut mlp_out, DROPOUT_RATE, r);
+                    }
+                }
+                for i in 0..N_EMBD { x[i] = mlp_out[i] + act.x_mid[li][i]; }
             }
-            for i in 0..N_EMBD { x[i] = mlp_out[i] + act.x_mid[li][i]; }
+
+            #[cfg(feature = "moe")]
+            {
+                // MoE: router → top-K experts → weighted sum
+                let mut router_logits = vec![0.0f32; N_EXPERTS];
+                linear_fwd(&xn_mlp, &model.layers[li].router, N_EXPERTS, N_EMBD, &mut router_logits);
+                let mut router_probs = vec![0.0f32; N_EXPERTS];
+                softmax_fwd(&router_logits, N_EXPERTS, &mut router_probs, 1.0);
+
+                // Top-K selection
+                let mut indices: Vec<usize> = (0..N_EXPERTS).collect();
+                indices.sort_by(|&a, &b| router_probs[b].partial_cmp(&router_probs[a]).unwrap());
+                let top_k_sum: f32 = (0..MOE_TOP_K).map(|k| router_probs[indices[k]]).sum();
+
+                // Run selected experts, weighted sum
+                let mut mlp_out = vec![0.0f32; N_EMBD];
+                for k in 0..MOE_TOP_K {
+                    let eidx = indices[k];
+                    let weight = router_probs[eidx] / top_k_sum;
+                    let mut h1 = vec![0.0f32; EXPERT_DIM];
+                    linear_fwd(&xn_mlp, &model.layers[li].expert_fc1[eidx], EXPERT_DIM, N_EMBD, &mut h1);
+                    let mut h2 = vec![0.0f32; EXPERT_DIM];
+                    for i in 0..EXPERT_DIM { h2[i] = if h1[i] > 0.0 { h1[i] * h1[i] } else { 0.0 }; }
+                    let mut expert_out = vec![0.0f32; N_EMBD];
+                    linear_fwd(&h2, &model.layers[li].expert_fc2[eidx], N_EMBD, EXPERT_DIM, &mut expert_out);
+                    for i in 0..N_EMBD { mlp_out[i] += weight * expert_out[i]; }
+                }
+
+                if training {
+                    if let Some(r) = rng.as_deref_mut() {
+                        apply_dropout(&mut mlp_out, DROPOUT_RATE, r);
+                    }
+                }
+                for i in 0..N_EMBD { x[i] = mlp_out[i] + act.x_mid[li][i]; }
+            }
         }
 
         act.x_out = x.clone();
@@ -229,21 +267,65 @@ pub fn forward_metal_logits(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>>
             );
         }
 
-        // fc1 on Metal
-        let h1_flat = metal_mm(&xn_mlp, seq_len, N_EMBD, &model.layers[li].fc1, MLP_DIM);
+        #[cfg(not(feature = "moe"))]
+        {
+            // fc1 on Metal
+            let h1_flat = metal_mm(&xn_mlp, seq_len, N_EMBD, &model.layers[li].fc1, MLP_DIM);
 
-        // Squared ReLU (CPU — elementwise)
-        let mut h2_flat = vec![0.0f32; seq_len * MLP_DIM];
-        for i in 0..h2_flat.len() {
-            let v = h1_flat[i];
-            h2_flat[i] = if v > 0.0 { v * v } else { 0.0 };
+            // Squared ReLU (CPU — elementwise)
+            let mut h2_flat = vec![0.0f32; seq_len * MLP_DIM];
+            for i in 0..h2_flat.len() {
+                let v = h1_flat[i];
+                h2_flat[i] = if v > 0.0 { v * v } else { 0.0 };
+            }
+
+            // fc2 on Metal
+            let mlp_out = metal_mm(&h2_flat, seq_len, MLP_DIM, &model.layers[li].fc2, N_EMBD);
+
+            // MLP residual
+            for i in 0..seq_len * N_EMBD { x_flat[i] = x_mid[i] + mlp_out[i]; }
         }
 
-        // fc2 on Metal
-        let mlp_out = metal_mm(&h2_flat, seq_len, MLP_DIM, &model.layers[li].fc2, N_EMBD);
+        #[cfg(feature = "moe")]
+        {
+            // Router on Metal for all tokens
+            let router_flat = metal_mm(&xn_mlp, seq_len, N_EMBD,
+                &model.layers[li].router, N_EXPERTS);
 
-        // MLP residual
-        for i in 0..seq_len * N_EMBD { x_flat[i] = x_mid[i] + mlp_out[i]; }
+            // Per-token MoE dispatch (CPU — expert matmuls are small)
+            let mut mlp_out_flat = vec![0.0f32; seq_len * N_EMBD];
+            for pos in 0..seq_len {
+                let mut router_probs = vec![0.0f32; N_EXPERTS];
+                softmax_fwd(&router_flat[pos * N_EXPERTS..(pos + 1) * N_EXPERTS],
+                            N_EXPERTS, &mut router_probs, 1.0);
+
+                let mut indices: Vec<usize> = (0..N_EXPERTS).collect();
+                indices.sort_by(|&a, &b| router_probs[b].partial_cmp(&router_probs[a]).unwrap());
+                let top_k_sum: f32 = (0..MOE_TOP_K).map(|k| router_probs[indices[k]]).sum();
+
+                let token_xn = &xn_mlp[pos * N_EMBD..(pos + 1) * N_EMBD];
+                for k in 0..MOE_TOP_K {
+                    let eidx = indices[k];
+                    let weight = router_probs[eidx] / top_k_sum;
+                    let mut h1 = vec![0.0f32; EXPERT_DIM];
+                    linear_fwd(token_xn, &model.layers[li].expert_fc1[eidx],
+                        EXPERT_DIM, N_EMBD, &mut h1);
+                    let mut h2 = vec![0.0f32; EXPERT_DIM];
+                    for i in 0..EXPERT_DIM {
+                        let v = h1[i]; h2[i] = if v > 0.0 { v * v } else { 0.0 };
+                    }
+                    let mut expert_out = vec![0.0f32; N_EMBD];
+                    linear_fwd(&h2, &model.layers[li].expert_fc2[eidx],
+                        N_EMBD, EXPERT_DIM, &mut expert_out);
+                    for i in 0..N_EMBD {
+                        mlp_out_flat[pos * N_EMBD + i] += weight * expert_out[i];
+                    }
+                }
+            }
+
+            // MLP residual
+            for i in 0..seq_len * N_EMBD { x_flat[i] = x_mid[i] + mlp_out_flat[i]; }
+        }
     }
 
     // LM head on Metal
@@ -291,6 +373,9 @@ pub fn forward_candle_train(
     let mask = Tensor::from_vec(mask_data, (1, 1, seq_len, seq_len), device)?; // [1,1,T,T]
 
     // ── Transformer layers ────────────────────────────────────────────
+    #[cfg(feature = "moe")]
+    let mut aux_loss_total: Option<Tensor> = None;
+
     for li in 0..N_LAYER {
         let layer = &model.layers[li];
 
@@ -341,15 +426,76 @@ pub fn forward_candle_train(
             x.broadcast_mul(&scale)?
         };
 
-        // fc1 → squared ReLU → fc2 + residual
+        // MLP / MoE block
         let xnm_2d = xn_mlp.reshape((batch * seq_len, N_EMBD))?;
-        let h1  = xnm_2d.matmul(&layer.fc1.as_tensor().t()?)?.reshape((batch, seq_len, MLP_DIM))?;
-        let h1r = h1.relu()?;
-        let h2  = h1r.mul(&h1r)?;                                     // squared ReLU [B, T, 4D]
-        let h2_2d = h2.reshape((batch * seq_len, MLP_DIM))?;
-        let mlp_out = h2_2d.matmul(&layer.fc2.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
-        let mlp_out = if training { candle_nn::ops::dropout(&mlp_out, DROPOUT_RATE)? } else { mlp_out };
-        x = (x + mlp_out)?;
+
+        #[cfg(not(feature = "moe"))]
+        {
+            // fc1 → squared ReLU → fc2 + residual
+            let h1  = xnm_2d.matmul(&layer.fc1.as_tensor().t()?)?.reshape((batch, seq_len, MLP_DIM))?;
+            let h1r = h1.relu()?;
+            let h2  = h1r.mul(&h1r)?;                                 // squared ReLU
+            let h2_2d = h2.reshape((batch * seq_len, MLP_DIM))?;
+            let mlp_out = h2_2d.matmul(&layer.fc2.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+            let mlp_out = if training { candle_nn::ops::dropout(&mlp_out, DROPOUT_RATE)? } else { mlp_out };
+            x = (x + mlp_out)?;
+        }
+
+        #[cfg(feature = "moe")]
+        {
+            let bt = batch * seq_len;
+
+            // Router logits → probs
+            let router_logits = xnm_2d.matmul(&layer.router.as_tensor().t()?)?; // [B*T, N_EXPERTS]
+            let router_probs = softmax(&router_logits, D::Minus1)?;
+
+            // Compute all experts (dense — N_EXPERTS=4 is small, pipelined on GPU)
+            let mut expert_outputs: Vec<Tensor> = Vec::with_capacity(N_EXPERTS);
+            for e in 0..N_EXPERTS {
+                let h1 = xnm_2d.matmul(&layer.expert_fc1[e].as_tensor().t()?)?; // [B*T, EXPERT_DIM]
+                let h1r = h1.relu()?;
+                let h2 = h1r.mul(&h1r)?;                              // squared ReLU
+                let out = h2.matmul(&layer.expert_fc2[e].as_tensor().t()?)?; // [B*T, N_EMBD]
+                expert_outputs.push(out);
+            }
+            let stacked = Tensor::stack(&expert_outputs, 1)?;         // [B*T, N_EXPERTS, N_EMBD]
+
+            // Top-K mask (computed on CPU — small tensor, mask is not differentiable)
+            let probs_cpu: Vec<f32> = router_probs.flatten_all()?.to_vec1::<f32>()?;
+            let mut mask_data = vec![0.0f32; bt * N_EXPERTS];
+            for t in 0..bt {
+                let row = &probs_cpu[t * N_EXPERTS..(t + 1) * N_EXPERTS];
+                let mut idx: Vec<usize> = (0..N_EXPERTS).collect();
+                idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
+                for k in 0..MOE_TOP_K {
+                    mask_data[t * N_EXPERTS + idx[k]] = 1.0;
+                }
+            }
+            let mask = Tensor::from_vec(mask_data, (bt, N_EXPERTS), device)?;
+
+            // Gate: mask router probs, renormalize
+            let gated = router_probs.mul(&mask)?;                     // [B*T, N_EXPERTS]
+            let gated_sum = gated.sum_keepdim(D::Minus1)?;            // [B*T, 1]
+            let gated_norm = gated.broadcast_div(&(gated_sum + 1e-8f64)?)?;
+
+            // Weighted expert combination
+            let weights = gated_norm.unsqueeze(2)?;                   // [B*T, N_EXPERTS, 1]
+            let weighted = stacked.broadcast_mul(&weights)?;          // [B*T, N_EXPERTS, N_EMBD]
+            let mlp_out = weighted.sum(1)?;                           // [B*T, N_EMBD]
+            let mlp_out = mlp_out.reshape((batch, seq_len, N_EMBD))?;
+
+            // Load-balancing auxiliary loss: N * sum(fraction_i * mean_prob_i)
+            let fraction = mask.mean(0)?;                             // [N_EXPERTS]
+            let mean_prob = router_probs.mean(0)?;                    // [N_EXPERTS]
+            let layer_aux = (fraction.mul(&mean_prob)?.sum_all()? * (N_EXPERTS as f64))?;
+            aux_loss_total = Some(match aux_loss_total {
+                None => layer_aux,
+                Some(prev) => (prev + layer_aux)?,
+            });
+
+            let mlp_out = if training { candle_nn::ops::dropout(&mlp_out, DROPOUT_RATE)? } else { mlp_out };
+            x = (x + mlp_out)?;
+        }
     }
 
     // ── LM head: [B, T, D] → [B*T, V] ───────────────────────────────
@@ -358,7 +504,14 @@ pub fn forward_candle_train(
 
     // ── Cross-entropy loss ────────────────────────────────────────────
     let targets_flat = targets.flatten_all()?;                        // [B*T] u32
-    candle_nn::loss::cross_entropy(&logits_2d, &targets_flat)
+    let ce_loss = candle_nn::loss::cross_entropy(&logits_2d, &targets_flat)?;
+
+    #[cfg(feature = "moe")]
+    let loss = (ce_loss + aux_loss_total.unwrap() * (MOE_AUX_LOSS_COEF as f64))?;
+    #[cfg(not(feature = "moe"))]
+    let loss = ce_loss;
+
+    Ok(loss)
 }
 
 // ── Unit tests ──────────────────────────────────────────────────────────────
