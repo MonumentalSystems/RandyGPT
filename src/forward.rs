@@ -599,4 +599,33 @@ mod tests {
             );
         }
     }
+
+    /// Verify that forward_metal_logits produces the same logits as the
+    /// per-token CPU forward() — exercises the MoE scatter-gather path
+    /// when the moe feature is active.
+    #[test]
+    fn metal_logits_matches_cpu_forward() {
+        let mut rng = Rng::new(99);
+        let vocab_size = 16;
+        let model = GPTModel::new(vocab_size, &mut rng);
+        let tokens: Vec<usize> = vec![3, 7, 1, 5, 2, 9, 0, 4];
+
+        // Reference: per-token CPU forward
+        let mut kv = (0..N_LAYER).map(|_| Vec::new()).collect();
+        let (cpu_logits, _) = forward(&tokens, &model, &mut kv, false, None, 0);
+
+        // Candidate: batched Metal (or CPU fallback) forward
+        let metal_logits = forward_metal_logits(&tokens, &model);
+
+        assert_eq!(cpu_logits.len(), metal_logits.len());
+        for pos in 0..tokens.len() {
+            assert_eq!(cpu_logits[pos].len(), metal_logits[pos].len());
+            for (j, (&c, &m)) in cpu_logits[pos].iter().zip(metal_logits[pos].iter()).enumerate() {
+                assert!(
+                    (c - m).abs() < 1e-3,
+                    "pos={pos} logit[{j}] mismatch: cpu={c:.6} vs metal={m:.6}"
+                );
+            }
+        }
+    }
 }

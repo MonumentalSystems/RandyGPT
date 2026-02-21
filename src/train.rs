@@ -146,10 +146,13 @@ fn generate_inner(
         next_token
     };
 
+    // KV-cache per-token decode for O(T) per step (all models including MoE).
+    // Unit test metal_logits_matches_cpu_forward proves forward() and
+    // forward_metal_logits() produce identical logits.
     let mut kv_cache: Vec<Vec<(Vec<f32>, Vec<f32>)>> =
         (0..N_LAYER).map(|_| Vec::new()).collect();
 
-    // Prefill: run the full prompt through forward() once to populate the KV cache.
+    // Prefill: get logits for the last prompt token.
     let (prefill_logits, _) = forward(&tokens, model, &mut kv_cache, false, None, 0);
     let mut last_logits = prefill_logits.last().unwrap().clone();
     let mut probs = vec![0.0f32; model.vocab_size];
@@ -161,6 +164,7 @@ fn generate_inner(
 
     while generated.len() < max_new_tokens {
         let next_token = sample(&last_logits, &mut probs, rng);
+
         if next_token == tokenizer.eos_id { break; }
         if stream {
             use std::io::Write;
@@ -171,16 +175,13 @@ fn generate_inner(
         tokens.push(next_token);
 
         if tokens.len() > BLOCK_SIZE {
-            // Slide the context window: keep last BLOCK_SIZE tokens.
-            // Use Metal-accelerated forward for the heavy matmuls — KV cache
-            // can't be reused after a slide (absolute position embeddings).
+            // Window slide: KV cache is invalidated, do a full forward
             tokens = tokens[tokens.len() - BLOCK_SIZE..].to_vec();
-            let logits = forward_metal_logits(&tokens, model);
-            last_logits = logits.into_iter().last().unwrap();
+            kv_cache = (0..N_LAYER).map(|_| Vec::new()).collect();
+            let (logits, _) = forward(&tokens, model, &mut kv_cache, false, None, 0);
+            last_logits = logits.last().unwrap().clone();
         } else {
-            // Decode: process only the single new token at its absolute position.
-            // The KV cache already holds entries for all prior positions, so this
-            // is O(context_len) attention but only O(1) embedding + projection work.
+            // Single-token KV-cache decode — O(1) projections, O(T) attention
             let abs_pos = tokens.len() - 1;
             let (decode_logits, _) =
                 forward(&tokens[abs_pos..abs_pos + 1], model, &mut kv_cache, false, None, abs_pos);

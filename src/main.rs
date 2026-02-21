@@ -672,6 +672,13 @@ fn main() -> std::io::Result<()> {
         return Ok(());
     }
 
+    // ── Re-seed RNG on resume so training sees fresh random orderings ──
+    // Without this, a resumed run replays the exact same batch sequence as
+    // the original run (deterministic xorshift from fixed seed 1337).
+    if iter_start > 0 {
+        rng = Rng::new(1337 ^ iter_start as u64);
+    }
+
     // ── Initial loss estimate ─────────────────────────────────────────
     println!("Estimating initial loss...");
     let initial_loss     = estimate_loss(&model, &data, &valid_starts, 50, &mut rng);
