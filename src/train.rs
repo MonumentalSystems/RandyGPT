@@ -20,6 +20,8 @@ use crate::ops::{
     softmax_bwd, softmax_fwd,
 };
 use crate::optimizer::{adam_step, get_learning_rate, zero_grads, GpuAdamState};
+#[cfg(feature = "fp16")]
+use crate::optimizer::DynamicLossScaler;
 use crate::rng::Rng;
 use crate::tokenizer::Tokenizer;
 use crate::metal::METAL_DEVICE;
@@ -748,6 +750,8 @@ pub fn train_candle(
     let mut stop_early      = false;
     let mut current_max_lr  = max_lr;          // ReduceLROnPlateau: decreases on plateau
     let mut lr_reductions   = 0usize;
+    #[cfg(feature = "fp16")]
+    let mut loss_scaler = DynamicLossScaler::new();
 
     for iter in iter_start..iterations {
         let iter_start_time = Instant::now();
@@ -804,8 +808,33 @@ pub fn train_candle(
             .unwrap_or_else(|e| panic!("loss scale: {}", e));
 
         // ── Single backward + optimizer step ──────────────────────────
-        let grads = mean_loss.backward()
+        // fp16: scale loss up before backward to prevent gradient underflow
+        #[cfg(feature = "fp16")]
+        let backward_loss = (mean_loss * loss_scaler.scale)
+            .unwrap_or_else(|e| panic!("loss scale: {}", e));
+        #[cfg(not(feature = "fp16"))]
+        let backward_loss = mean_loss;
+
+        let grads = backward_loss.backward()
             .unwrap_or_else(|e| panic!("backward: {}", e));
+
+        // fp16: check for inf/nan gradients, skip step on overflow
+        #[cfg(feature = "fp16")]
+        let grad_scale = loss_scaler.scale;
+        #[cfg(not(feature = "fp16"))]
+        let grad_scale = 1.0f64;
+
+        let vars = model.all_vars();
+
+        #[cfg(feature = "fp16")]
+        {
+            let overflow = DynamicLossScaler::has_overflow(&grads, &vars);
+            if !loss_scaler.update(overflow) {
+                // Overflow — skip this optimizer step entirely
+                eprintln!("  [fp16] overflow at iter {}, scale → {:.0}", iter, loss_scaler.scale);
+                continue;
+            }
+        }
 
         step += 1;
         let lr = {
@@ -820,8 +849,7 @@ pub fn train_candle(
         };
 
         // ── Full GPU AdamW: clip + update all Vars on Metal, no CPU transfer ──
-        let vars = model.all_vars();
-        opt.step(&grads, &vars, lr)
+        opt.step(&grads, &vars, lr, grad_scale)
             .unwrap_or_else(|e| panic!("adam step: {}", e));
 
         iter_count    += 1;

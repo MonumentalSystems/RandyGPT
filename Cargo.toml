@@ -14,6 +14,7 @@ model-l  = []   # 256-dim, 8-head, 6-layer,  ~4.82M params, ~1835ms/iter
 model-deep = [] # 192-dim, 6-head, 16-layer, ~7.5M params — depth experiment
 model-xl = []   # 384-dim, 8-head, 8-layer,  ~10.8M params, ~4000ms/iter
 moe = []        # Mixture-of-Experts — combine with model size, e.g. --features "model-ds,moe"
+fp16 = []       # Mixed-precision: fp16 matmuls, fp32 norms/softmax/loss. Combine with any model.
 
 [dependencies]
 candle-nn = "0.9.2"

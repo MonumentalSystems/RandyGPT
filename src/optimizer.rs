@@ -33,11 +33,13 @@ pub mod gpu_adam {
 
         /// Full GPU AdamW step with per-element gradient clipping.
         /// `vars` must be the same slice (same order) used in `new()`.
+        /// `grad_scale` divides gradients before clipping (1.0 = no scaling).
         pub fn step(
             &mut self,
             grads: &GradStore,
             vars: &[Var],
             lr: f32,
+            grad_scale: f64,
         ) -> CResult<()> {
             self.step_t += 1;
             let t = self.step_t as i32;
@@ -46,11 +48,12 @@ pub mod gpu_adam {
             let scale_m = 1.0 / bc1;
             let scale_v = 1.0 / bc2;
             let lr_wd   = lr as f64 * WEIGHT_DECAY as f64;
+            let inv_scale = 1.0 / grad_scale;
 
             for (i, var) in vars.iter().enumerate() {
                 if let Some(g) = grads.get(var) {
-                    // L∞ gradient clip (elementwise clamp — stays on GPU)
-                    let g = g.clamp(-GRAD_CLIP as f64, GRAD_CLIP as f64)?;
+                    // Unscale (fp16 loss scaling) + L∞ gradient clip — stays on GPU
+                    let g = (g * inv_scale)?.clamp(-GRAD_CLIP as f64, GRAD_CLIP as f64)?;
 
                     let m_prev = self.m[i].as_tensor();
                     let v_prev = self.v[i].as_tensor();
@@ -103,6 +106,54 @@ pub mod gpu_adam {
             Ok(Self { m, v, step_t: 0 })
         }
     }
+}
+
+// ── Dynamic loss scaler for fp16 mixed-precision training ──────────
+#[cfg(feature = "fp16")]
+pub struct DynamicLossScaler {
+    pub scale: f64,
+    good_steps: usize,
+    overflow_count: usize,
+}
+
+#[cfg(feature = "fp16")]
+impl DynamicLossScaler {
+    pub fn new() -> Self {
+        Self { scale: 32768.0, good_steps: 0, overflow_count: 0 }
+    }
+
+    /// Check if any gradient contains inf/nan. Queues GPU reductions,
+    /// then pulls scalars — first to_scalar flushes the command buffer.
+    pub fn has_overflow(grads: &candle_core::backprop::GradStore, vars: &[candle_core::Var]) -> bool {
+        for var in vars {
+            if let Some(g) = grads.get(var) {
+                match g.abs().and_then(|t| t.sum_all()).and_then(|t| t.to_scalar::<f32>()) {
+                    Ok(v) if v.is_finite() => continue,
+                    _ => return true,
+                }
+            }
+        }
+        false
+    }
+
+    /// Update scale after a step. Returns true if this step was good (no overflow).
+    pub fn update(&mut self, overflow: bool) -> bool {
+        if overflow {
+            self.scale = (self.scale * 0.5).max(1.0);
+            self.good_steps = 0;
+            self.overflow_count += 1;
+            false
+        } else {
+            self.good_steps += 1;
+            if self.good_steps >= 2000 {
+                self.scale *= 2.0;
+                self.good_steps = 0;
+            }
+            true
+        }
+    }
+
+    pub fn overflow_count(&self) -> usize { self.overflow_count }
 }
 
 // AdamW step: Adam with decoupled weight decay.

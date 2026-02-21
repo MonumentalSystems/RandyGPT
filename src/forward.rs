@@ -10,6 +10,30 @@ use crate::model::{CandleModel, GPTModel, PosActs};
 use crate::ops::{apply_dropout, linear_fwd, rmsnorm_fwd, softmax_fwd};
 use crate::rng::Rng;
 
+/// Matmul wrapper (plain matmul — fp16 casting is done at layer boundaries).
+#[inline(always)]
+fn mm(a: &Tensor, b: &Tensor) -> CResult<Tensor> {
+    a.matmul(b)
+}
+
+/// Cast tensor to fp16 if feature enabled, otherwise no-op.
+#[cfg(feature = "fp16")]
+#[inline(always)]
+fn to_half(t: &Tensor) -> CResult<Tensor> { t.to_dtype(candle_core::DType::F16) }
+
+#[cfg(not(feature = "fp16"))]
+#[inline(always)]
+fn to_half(t: &Tensor) -> CResult<Tensor> { Ok(t.clone()) }
+
+/// Cast tensor back to fp32 if feature enabled, otherwise no-op.
+#[cfg(feature = "fp16")]
+#[inline(always)]
+fn to_full(t: &Tensor) -> CResult<Tensor> { t.to_dtype(candle_core::DType::F32) }
+
+#[cfg(not(feature = "fp16"))]
+#[inline(always)]
+fn to_full(t: &Tensor) -> CResult<Tensor> { Ok(t.clone()) }
+
 /// Per-token autoregressive forward pass with KV cache.
 /// Returns (logits_per_position, activations_per_position).
 /// Used during training so activations are available for backward.
@@ -195,7 +219,7 @@ pub fn forward_metal_logits(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>>
                     w_data: &[f32], nout: usize| -> Vec<f32> {
         let x_t = Tensor::from_slice(x_data, (t, nin), device).unwrap();
         let w_t = Tensor::from_slice(w_data, (nout, nin), device).unwrap();
-        x_t.matmul(&w_t.t().unwrap()).unwrap()
+        mm(&x_t, &w_t.t().unwrap()).unwrap()
             .flatten_all().unwrap()
             .to_vec1::<f32>().unwrap()
     };
@@ -292,33 +316,57 @@ pub fn forward_metal_logits(tokens: &[usize], model: &GPTModel) -> Vec<Vec<f32>>
             let router_flat = metal_mm(&xn_mlp, seq_len, N_EMBD,
                 &model.layers[li].router, N_EXPERTS);
 
-            // Per-token MoE dispatch (CPU — expert matmuls are small)
-            let mut mlp_out_flat = vec![0.0f32; seq_len * N_EMBD];
+            // Scatter-gather MoE: batch router top-K, then per-expert metal_mm
+            // 1. Softmax + top-K for all tokens → per-expert token assignments
+            let mut expert_tokens: Vec<Vec<usize>> = vec![vec![]; N_EXPERTS];
+            let mut expert_weights: Vec<Vec<f32>> = vec![vec![]; N_EXPERTS];
             for pos in 0..seq_len {
                 let mut router_probs = vec![0.0f32; N_EXPERTS];
                 softmax_fwd(&router_flat[pos * N_EXPERTS..(pos + 1) * N_EXPERTS],
                             N_EXPERTS, &mut router_probs, 1.0);
-
                 let mut indices: Vec<usize> = (0..N_EXPERTS).collect();
                 indices.sort_by(|&a, &b| router_probs[b].partial_cmp(&router_probs[a]).unwrap());
                 let top_k_sum: f32 = (0..MOE_TOP_K).map(|k| router_probs[indices[k]]).sum();
-
-                let token_xn = &xn_mlp[pos * N_EMBD..(pos + 1) * N_EMBD];
                 for k in 0..MOE_TOP_K {
                     let eidx = indices[k];
-                    let weight = router_probs[eidx] / top_k_sum;
-                    let mut h1 = vec![0.0f32; EXPERT_DIM];
-                    linear_fwd(token_xn, &model.layers[li].expert_fc1[eidx],
-                        EXPERT_DIM, N_EMBD, &mut h1);
-                    let mut h2 = vec![0.0f32; EXPERT_DIM];
-                    for i in 0..EXPERT_DIM {
-                        let v = h1[i]; h2[i] = if v > 0.0 { v * v } else { 0.0 };
-                    }
-                    let mut expert_out = vec![0.0f32; N_EMBD];
-                    linear_fwd(&h2, &model.layers[li].expert_fc2[eidx],
-                        N_EMBD, EXPERT_DIM, &mut expert_out);
-                    for i in 0..N_EMBD {
-                        mlp_out_flat[pos * N_EMBD + i] += weight * expert_out[i];
+                    expert_tokens[eidx].push(pos);
+                    expert_weights[eidx].push(router_probs[eidx] / top_k_sum);
+                }
+            }
+
+            // 2. For each expert: gather → metal_mm(fc1) → sqReLU → metal_mm(fc2) → scatter
+            let mut mlp_out_flat = vec![0.0f32; seq_len * N_EMBD];
+            for e in 0..N_EXPERTS {
+                let n_tok = expert_tokens[e].len();
+                if n_tok == 0 { continue; }
+
+                // Gather: pack assigned tokens into contiguous [n_tok, N_EMBD]
+                let mut gathered = vec![0.0f32; n_tok * N_EMBD];
+                for (i, &pos) in expert_tokens[e].iter().enumerate() {
+                    gathered[i * N_EMBD..(i + 1) * N_EMBD]
+                        .copy_from_slice(&xn_mlp[pos * N_EMBD..(pos + 1) * N_EMBD]);
+                }
+
+                // fc1 on Metal (one matmul for all assigned tokens)
+                let h1 = metal_mm(&gathered, n_tok, N_EMBD,
+                    &model.layers[li].expert_fc1[e], EXPERT_DIM);
+
+                // Squared ReLU (CPU — elementwise)
+                let mut h2 = vec![0.0f32; n_tok * EXPERT_DIM];
+                for i in 0..h2.len() {
+                    let v = h1[i];
+                    h2[i] = if v > 0.0 { v * v } else { 0.0 };
+                }
+
+                // fc2 on Metal
+                let expert_out = metal_mm(&h2, n_tok, EXPERT_DIM,
+                    &model.layers[li].expert_fc2[e], N_EMBD);
+
+                // Scatter back with gating weights
+                for (i, &pos) in expert_tokens[e].iter().enumerate() {
+                    let w = expert_weights[e][i];
+                    for j in 0..N_EMBD {
+                        mlp_out_flat[pos * N_EMBD + j] += w * expert_out[i * N_EMBD + j];
                     }
                 }
             }
@@ -388,33 +436,35 @@ pub fn forward_candle_train(
         };
 
         // QKV projections: flatten [B,T,D]→[B*T,D], matmul [D,D]^T, reshape back
+        // fp16: cast input once, keep Q/K/V in fp16 through attention matmuls
         let xn_2d = xn.reshape((batch * seq_len, N_EMBD))?;
-        let q = xn_2d.matmul(&layer.wq.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
-        let k = xn_2d.matmul(&layer.wk.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
-        let v = xn_2d.matmul(&layer.wv.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let xn_2d_h = to_half(&xn_2d)?;
+        let q = mm(&xn_2d_h, &to_half(&layer.wq.as_tensor().t()?)?)?.reshape((batch, seq_len, N_EMBD))?;
+        let k = mm(&xn_2d_h, &to_half(&layer.wk.as_tensor().t()?)?)?.reshape((batch, seq_len, N_EMBD))?;
+        let v = mm(&xn_2d_h, &to_half(&layer.wv.as_tensor().t()?)?)?.reshape((batch, seq_len, N_EMBD))?;
 
         // Reshape to multi-head: [B, T, H, Dh] → [B, H, T, Dh]
         let q = q.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?; // [B,H,T,Dh]
         let k = k.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?;
         let v = v.reshape((batch, seq_len, N_HEAD, HEAD_DIM))?.transpose(1, 2)?.contiguous()?;
 
-        // Attention scores: [B, H, T, T]
+        // Attention scores: [B, H, T, T]  — Q×K^T stays in fp16, cast to fp32 for softmax
         let scale_f = (HEAD_DIM as f64).sqrt().recip();
-        let scores = q.matmul(&k.transpose(2, 3)?)?.affine(scale_f, 0.0)?;
+        let scores = to_full(&mm(&q, &k.transpose(2, 3)?)?)?.affine(scale_f, 0.0)?;
         let scores = scores.broadcast_add(&mask)?;                    // apply causal mask
-        let attn_w = softmax(&scores, D::Minus1)?;                   // [B, H, T, T]
+        let attn_w = softmax(&scores, D::Minus1)?;                   // fp32 softmax [B, H, T, T]
 
-        // Weighted sum: [B, H, T, T] × [B, H, T, Dh] → [B, H, T, Dh]
-        let attn_out = attn_w.matmul(&v)?;
+        // Weighted sum: cast attn_w back to fp16, V is already fp16 → [B, H, T, Dh] fp16
+        let attn_out = mm(&to_half(&attn_w)?, &v)?;
 
         // Merge heads: [B, H, T, Dh] → [B, T, D]
         let attn_out = attn_out.transpose(1, 2)?
             .contiguous()?
             .reshape((batch, seq_len, N_EMBD))?;
 
-        // Output projection + residual: flatten → matmul → reshape → add
+        // Output projection + residual: cast to fp32 after Wo matmul
         let attn_2d = attn_out.reshape((batch * seq_len, N_EMBD))?;
-        let proj = attn_2d.matmul(&layer.wo.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+        let proj = to_full(&mm(&attn_2d, &to_half(&layer.wo.as_tensor().t()?)?)?)?.reshape((batch, seq_len, N_EMBD))?;
         let proj = if training { candle_nn::ops::dropout(&proj, DROPOUT_RATE)? } else { proj };
         x = (x + proj)?;                                              // residual
 
@@ -431,12 +481,13 @@ pub fn forward_candle_train(
 
         #[cfg(not(feature = "moe"))]
         {
-            // fc1 → squared ReLU → fc2 + residual
-            let h1  = xnm_2d.matmul(&layer.fc1.as_tensor().t()?)?.reshape((batch, seq_len, MLP_DIM))?;
+            // fc1 → squared ReLU → fc2 + residual (fp16: cast input+weights once)
+            let xnm_2d_h = to_half(&xnm_2d)?;
+            let h1  = mm(&xnm_2d_h, &to_half(&layer.fc1.as_tensor().t()?)?)?.reshape((batch, seq_len, MLP_DIM))?;
             let h1r = h1.relu()?;
             let h2  = h1r.mul(&h1r)?;                                 // squared ReLU
             let h2_2d = h2.reshape((batch * seq_len, MLP_DIM))?;
-            let mlp_out = h2_2d.matmul(&layer.fc2.as_tensor().t()?)?.reshape((batch, seq_len, N_EMBD))?;
+            let mlp_out = to_full(&mm(&h2_2d, &to_half(&layer.fc2.as_tensor().t()?)?)?)?.reshape((batch, seq_len, N_EMBD))?;
             let mlp_out = if training { candle_nn::ops::dropout(&mlp_out, DROPOUT_RATE)? } else { mlp_out };
             x = (x + mlp_out)?;
         }
@@ -445,43 +496,33 @@ pub fn forward_candle_train(
         {
             let bt = batch * seq_len;
 
-            // Router logits → probs
-            let router_logits = xnm_2d.matmul(&layer.router.as_tensor().t()?)?; // [B*T, N_EXPERTS]
+            // Router logits → probs (GPU, fp32 for softmax precision)
+            let router_logits = mm(&xnm_2d, &layer.router.as_tensor().t()?)?; // [B*T, N_EXPERTS]
             let router_probs = softmax(&router_logits, D::Minus1)?;
 
-            // Compute all experts (dense — N_EXPERTS=4 is small, pipelined on GPU)
-            let mut expert_outputs: Vec<Tensor> = Vec::with_capacity(N_EXPERTS);
-            for e in 0..N_EXPERTS {
-                let h1 = xnm_2d.matmul(&layer.expert_fc1[e].as_tensor().t()?)?; // [B*T, EXPERT_DIM]
-                let h1r = h1.relu()?;
-                let h2 = h1r.mul(&h1r)?;                              // squared ReLU
-                let out = h2.matmul(&layer.expert_fc2[e].as_tensor().t()?)?; // [B*T, N_EMBD]
-                expert_outputs.push(out);
-            }
-            let stacked = Tensor::stack(&expert_outputs, 1)?;         // [B*T, N_EXPERTS, N_EMBD]
-
-            // Top-K mask (computed on CPU — small tensor, mask is not differentiable)
-            let probs_cpu: Vec<f32> = router_probs.flatten_all()?.to_vec1::<f32>()?;
-            let mut mask_data = vec![0.0f32; bt * N_EXPERTS];
-            for t in 0..bt {
-                let row = &probs_cpu[t * N_EXPERTS..(t + 1) * N_EXPERTS];
-                let mut idx: Vec<usize> = (0..N_EXPERTS).collect();
-                idx.sort_by(|&a, &b| row[b].partial_cmp(&row[a]).unwrap());
-                for k in 0..MOE_TOP_K {
-                    mask_data[t * N_EXPERTS + idx[k]] = 1.0;
-                }
-            }
-            let mask = Tensor::from_vec(mask_data, (bt, N_EXPERTS), device)?;
+            // Top-K mask entirely on GPU — no CPU↔GPU sync
+            let sorted_idx = router_probs.arg_sort_last_dim(false)?;  // [bt, N_EXPERTS] desc
+            let sorted_vals = router_probs.gather(&sorted_idx, 1)?;   // [bt, N_EXPERTS] desc
+            let threshold = sorted_vals.narrow(1, MOE_TOP_K - 1, 1)?; // [bt, 1] K-th largest
+            let mask = router_probs.ge(&threshold.broadcast_as((bt, N_EXPERTS))?)?
+                .to_dtype(xnm_2d.dtype())?;                           // [bt, N_EXPERTS] 0/1
 
             // Gate: mask router probs, renormalize
             let gated = router_probs.mul(&mask)?;                     // [B*T, N_EXPERTS]
             let gated_sum = gated.sum_keepdim(D::Minus1)?;            // [B*T, 1]
             let gated_norm = gated.broadcast_div(&(gated_sum + 1e-8f64)?)?;
 
-            // Weighted expert combination
-            let weights = gated_norm.unsqueeze(2)?;                   // [B*T, N_EXPERTS, 1]
-            let weighted = stacked.broadcast_mul(&weights)?;          // [B*T, N_EXPERTS, N_EMBD]
-            let mlp_out = weighted.sum(1)?;                           // [B*T, N_EMBD]
+            // Dense expert dispatch — fp16: cast input once, reuse for all experts
+            let xnm_2d_h = to_half(&xnm_2d)?;
+            let mut mlp_out = Tensor::zeros((bt, N_EMBD), xnm_2d.dtype(), device)?;
+            for e in 0..N_EXPERTS {
+                let h1 = mm(&xnm_2d_h, &to_half(&layer.expert_fc1[e].as_tensor().t()?)?)?;
+                let h1r = h1.relu()?;
+                let h2 = h1r.mul(&h1r)?;                              // [bt, EXPERT_DIM]
+                let out_e = to_full(&mm(&h2, &to_half(&layer.expert_fc2[e].as_tensor().t()?)?)?)? ; // [bt, N_EMBD]
+                let w_e = gated_norm.narrow(1, e, 1)?;                // [bt, 1]
+                mlp_out = (mlp_out + out_e.broadcast_mul(&w_e)?)?;
+            }
             let mlp_out = mlp_out.reshape((batch, seq_len, N_EMBD))?;
 
             // Load-balancing auxiliary loss: N * sum(fraction_i * mean_prob_i)
@@ -500,7 +541,7 @@ pub fn forward_candle_train(
 
     // ── LM head: [B, T, D] → [B*T, V] ───────────────────────────────
     let x_2d = x.reshape((batch * seq_len, N_EMBD))?;
-    let logits_2d = x_2d.matmul(&model.lm_head.as_tensor().t()?)?;   // [B*T, V]
+    let logits_2d = to_full(&mm(&to_half(&x_2d)?, &to_half(&model.lm_head.as_tensor().t()?)?)?)?; // [B*T, V]
 
     // ── Cross-entropy loss ────────────────────────────────────────────
     let targets_flat = targets.flatten_all()?;                        // [B*T] u32
