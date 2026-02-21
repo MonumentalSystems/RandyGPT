@@ -4,28 +4,28 @@ All notable changes to randyGPT are documented here.
 
 ## Version Comparison
 
-| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 | v0.9.2 | v0.9.4 |
-|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|--------|--------|
-| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 |
-| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 | 256 | 256 |
-| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M | ~4.82M | ~4.82M |
-| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** |
-| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
-| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** |
-| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** | same | same |
-| **Tokenizer** | char | char | char | char | char | char | char | char | char | char | char | **char + BPE** | **char + BPE** |
-| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
-| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** | ✅ RGPT0003 | ✅ RGPT0003 |
-| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
-| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** | ✅ val-based | ✅ val-based |
-| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim |
-| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
-| **HTTP server** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **--serve** |
-| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 | 64 |
-| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** | **256** |
-| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | **87.1** (BPE†) | same |
-| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 | ~1870 |
+| Feature | v0.1 | v0.2 | v0.3 | v0.4 | v0.5.1 | v0.6.0 | v0.7.0 | v0.7.1 | v0.8.0 | v0.8.5 | v0.9.1 | v0.9.2 | v0.9.4 | v0.9.8 |
+|---------|------|------|------|------|--------|--------|--------|--------|--------|--------|--------|--------|--------|--------|
+| **Layers** | 1 | 4 | 4 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 6 | 12 (MoE) |
+| **Embedding Dim** | 32 | 128 | 128 | 128* | 128 | 128 | 128 | 256 | 256 | 256 | 256 | 256 | 256 | 128 |
+| **Parameters** | ~10K | ~800K | ~800K | ~1.2M | ~1.2M | ~1.2M | ~1.2M | ~4.77M | ~4.77M | ~4.77M | ~4.82M | ~4.82M | ~4.82M | ~2.78M+MoE |
+| **Training** | ❌ | ✅ Single-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ Multi-core | ✅ **GPU autograd** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU** | ✅ **Full GPU + fp16** |
+| **Attention grads** | ❌ | Q only | Q only | Q only | Q only | ✅ Q+K+V | ✅ Q+K+V | ✅ Q+K+V | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd | ✅ Candle autograd |
+| **Optimizer** | - | Adam | Adam | AdamW | AdamW | AdamW | AdamW | AdamW | AdamW (CPU moments) | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU moments)** | **AdamW (GPU) + loss scaling** |
+| **LR Schedule** | - | Immediate decay | Immediate decay | Constant→Decay | Constant→Decay | Constant→Decay | Constant→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay | Warmup→60%→Decay + **--lr flag** | same | same | same |
+| **Tokenizer** | char | char | char | char | char | char | char | char | char | char | char | **char + BPE** | **char + BPE** | **char + BPE** |
+| **Dropout** | ❌ | ❌ | ❌ | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) | ✅ (0.1) |
+| **Checkpoints** | ❌ | ❌ | ❌ | ❌ | ✅ memory-buffered | ✅ | ✅ | ✅ | ✅ RGPT0002 | ✅ **RGPT0003** | ✅ RGPT0003 **best=val** | ✅ RGPT0003 | ✅ RGPT0003 | ✅ **RGPT0004** (MoE) |
+| **Ctrl-C save** | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Val loss / ppl** | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| **Early stopping** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ patience=20 | ✅ **val-based** | ✅ val-based | ✅ val-based | ✅ val-based |
+| **Metal GPU** | ❌ | ❌ | ❌ | ✅ | ✅ (stable) | ✅ | ✅ | ✅ | ✅ training | ✅ **fwd+bwd+optim** | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim | ✅ fwd+bwd+optim | ✅ **fp16 matmuls** |
+| **BLAS (Accelerate)** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ sgemv/sger | ✅ +sgemm | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) | ✅ (CPU fallback) |
+| **HTTP server** | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ❌ | ✅ **--serve** | ✅ --serve |
+| **Batch size** | - | - | - | - | - | - | 32 | 128 | 128 | 64 | 64 | 64 | 64 | 64 |
+| **Context window** | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | 64 | **256** | **256** | **256** | **256** | **256** |
+| **Best val ppl** | - | - | - | - | - | - | - | 10.8 | 10.8 | - | **10.6** | **87.1** (BPE†) | same | MoE TBD |
+| **Speed (ms/iter)** | - | ~600 | ~78s total | ~450 | ~450 | ~450 | ~215 | ~96§ | ~49¶ | ~1835 | ~1835 | ~1870 | ~1870 | **~2434** (MoE fp16) |
 
 †RSS ~1GB real at T=256; Activity Monitor shows 4-8GB (Metal unified memory pool — not CPU-resident)
 ‡Estimated
@@ -33,6 +33,59 @@ All notable changes to randyGPT are documented here.
 ¶Candle Metal autograd; confirmed 488ms/iter over 500 iters; ~2× vs v0.7.1 CPU; 60.9% GPU; val ppl 10.8 @ iter 1000
 \*v0.4 targeted 256-dim but shipped at 128 due to the Metal memory issue fixed in v0.5
 †BPE ppl 87.1 ≈ char-equiv ppl ~1.7 — not directly comparable to char-level ppl (see v0.9.2 notes)
+
+---
+
+## [0.9.8] - 2026-02-21
+
+### Mixture-of-Experts Optimizations + fp16 Mixed Precision
+
+#### MoE Performance (model-ds, M4 Pro 24GB)
+
+| Optimization | ms/iter | vs baseline |
+|---|---|---|
+| Baseline (dense, per-expert loop) | 3290 | — |
+| Stacked matmul | 3192 | -3% |
+| Sparse dispatch (gather-only) | 3020 | -8% |
+| GPU top-K + dense (no CPU sync) | 2900 | -12% |
+| + Persistent fp16 | 2434 | **-26%** |
+
+#### GPU-Only Top-K Mask (`forward.rs`)
+- Replaced CPU top-K sort (which forced GPU→CPU sync 12× per forward pass) with pure GPU ops: `arg_sort_last_dim` + `gather` + `ge` threshold comparison
+- Eliminates all `to_vec1()` CPU↔GPU syncs in the MoE forward pass
+- ~170ms/iter improvement from eliminating pipeline stalls alone
+
+#### Dense Expert Dispatch with Gating Zeros (`forward.rs`)
+- All N_EXPERTS=4 experts compute on all B×T tokens; gating weights are zero for non-selected experts
+- Trades 2× expert FLOPs for elimination of gather/scatter/index_select overhead
+- Net positive at 128-dim where kernel launch overhead dominates over FLOP cost
+- Simpler code, lower peak memory (no intermediate sparse tensors)
+
+#### Persistent fp16 Mixed Precision (`--features fp16`)
+- New `fp16` cargo feature flag — compile-time opt-in, zero overhead when disabled
+- `to_half()` / `to_full()` helpers cast at layer boundaries, not per-matmul
+- fp16 regions: QKV projections, Q×K^T, attn×V, Wo projection, expert fc1/fc2 chains, LM head
+- fp32 regions: RMSNorm, attention softmax, router softmax, gating, cross-entropy loss
+- ~26% faster than fp32 baseline (3290→2434ms/iter on model-ds MoE)
+
+#### Dynamic Loss Scaling for fp16 (`optimizer.rs`, `train.rs`)
+- `DynamicLossScaler` struct: scales loss up before backward to prevent gradient underflow
+- Overflow detection: checks `abs(grad).sum()` per Var for inf/nan (one GPU→CPU sync per step)
+- On overflow: halves scale, skips optimizer step, logs warning
+- On 2000 consecutive good steps: doubles scale back up
+- `GpuAdamState::step` accepts `grad_scale` parameter — unscales gradients before clipping
+
+#### Metal Inference: Scatter-Gather Batched Dispatch (`forward.rs`)
+- Replaced per-token sgemv loop (O(T×K) kernel calls) with per-expert `metal_mm` (O(N_EXPERTS) calls)
+- For each expert: gather assigned tokens → single `metal_mm(fc1)` → squared ReLU → `metal_mm(fc2)` → scatter back with weights
+- With T=256, MOE_TOP_K=2, N_EXPERTS=4: ~512 sgemv calls → ~8 metal_mm calls per layer
+
+#### Candle Metal Backend Issues (`CANDLE_METAL_ISSUES.md`)
+- Documented 4 edge cases encountered during MoE development on Metal:
+  1. `scatter_add` U32 index dtype lost → F32 on Metal
+  2. `broadcast_as` + `contiguous()` converts U32 → F32
+  3. Per-matmul fp16 cast overhead negates throughput gain for small models
+  4. GPU↔CPU sync for MoE router top-K causes pipeline stalls
 
 ---
 
@@ -797,7 +850,8 @@ Cores used: 12 available, ~8 effectively utilized
 - [x] **`load_checkpoint_cpu`** — reads any checkpoint format (v1/v2/v3) for CPU inference
 - [x] **Gutenberg corpus** — 106MB, 100+ public domain novels, ~55M BPE-500 tokens
 - [x] **EVAL_INTERVAL** bumped to 25 (from 10) — less eval overhead, ~10% faster training
-- [ ] Mixed precision (f16) training on Metal
+- [x] Mixed precision (fp16) training on Metal — persistent layer-boundary casting + dynamic loss scaling (v0.9.8)
+- [x] Mixture-of-Experts — 4 experts, top-2 gating, GPU top-K, dense dispatch, aux load-balancing loss (v0.9.8)
 - [ ] KV cache for generation
 
 ---

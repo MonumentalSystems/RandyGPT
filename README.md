@@ -7,6 +7,8 @@ A GPT-style language model implemented from scratch in Rust. Training runs on Me
 - **Transformer Architecture**: Multi-head causal attention, feed-forward layers, residual connections, RMSNorm
 - **Metal GPU Training**: Candle autograd on Apple M-series — forward + backward + AdamW fully on GPU
 - **CPU / Linux Fallback**: Rayon multi-core + Accelerate BLAS when Metal unavailable; builds natively on Linux
+- **Mixture-of-Experts**: 4 experts, top-2 gating, GPU-only top-K mask, dense dispatch (`--features moe`)
+- **fp16 Mixed Precision**: Persistent layer-boundary casting, dynamic loss scaling (`--features fp16`)
 - **Full Training Loop**: AdamW, gradient clipping, dropout, ReduceLROnPlateau, cosine decay
 - **GPT-2 Style Init**: Scaled output projections for stable deep training
 - **Checkpoint Save/Resume**: RGPT0003 format (weights + optimizer moments); resumes LR schedule exactly
@@ -27,7 +29,16 @@ A GPT-style language model implemented from scratch in Rust. Training runs on Me
 | model-deep | 192 | 6 | 16 | ~7.5M | `--features model-deep` |
 | model-xl | 384 | 8 | 8 | ~10.8M | `--features model-xl` |
 
-Default hyperparameters (v0.9.5):
+**Optional features** (combine with any preset):
+
+| Feature | Flag | Description |
+|---------|------|-------------|
+| MoE | `--features moe` | 4 experts, top-2 gating, GPU top-K, dense dispatch |
+| fp16 | `--features fp16` | Mixed-precision matmuls, dynamic loss scaling |
+
+Example: `cargo build --release --features "model-ds,moe,fp16"`
+
+Default hyperparameters (v0.9.8):
 
 | Hyperparameter | Value |
 |----------------|-------|
@@ -204,6 +215,11 @@ RSS memory: ~400 MB real; Activity Monitor shows ~3 GB (Metal unified memory map
 - [x] PyTorch training on NVIDIA GPU — Colab T4/V100/A100, RGPT0003-compatible checkpoints (v0.9.7)
 - [x] Gutenberg corpus v2 cleaning — Ulysses excluded, pipes/emails/repeated chars stripped (v0.9.7)
 - [x] 1500-token BPE vocab rebuilt from cleaned v2 corpus (v0.9.7)
+- [x] Mixture-of-Experts — 4 experts, top-2 gating, aux load-balancing loss, RGPT0004 checkpoint format (v0.9.8)
+- [x] GPU-only top-K mask — eliminates CPU↔GPU sync in MoE forward pass (v0.9.8)
+- [x] fp16 mixed precision — persistent layer-boundary casting, ~26% speedup on model-ds MoE (v0.9.8)
+- [x] Dynamic loss scaling — overflow detection, auto scale adjustment, gradient unscaling (v0.9.8)
+- [x] Metal inference scatter-gather — batched per-expert metal_mm, O(N_EXPERTS) vs O(T×K) kernels (v0.9.8)
 
 ## HuggingFace Export & Deployment
 
